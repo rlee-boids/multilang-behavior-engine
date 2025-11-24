@@ -18,8 +18,8 @@ class GitHubRepoInfo:
     owner: str
     name: str
     html_url: str
-    default_branch: str
     clone_url: str
+    default_branch: str
 
 
 class GitHubClient:
@@ -56,7 +56,6 @@ class GitHubClient:
     async def ensure_repo(self, repo_name: str, private: bool = True) -> GitHubRepoInfo:
         """
         Ensure a repo exists under the configured owner, creating it if needed.
-        Returns GitHubRepoInfo with html_url + clone_url.
         """
         owner = self.owner_name
 
@@ -81,12 +80,17 @@ class GitHubClient:
             resp = await self._request("POST", create_path, json=body)
             data = resp.json()
 
+        html_url = data["html_url"]
+        clone_url = data.get("clone_url") or (
+            html_url + ".git" if not html_url.endswith(".git") else html_url
+        )
+
         return GitHubRepoInfo(
             owner=data["owner"]["login"],
             name=data["name"],
-            html_url=data["html_url"],
+            html_url=html_url,
+            clone_url=clone_url,
             default_branch=data.get("default_branch", "main"),
-            clone_url=data["clone_url"],
         )
 
     async def create_or_update_file(

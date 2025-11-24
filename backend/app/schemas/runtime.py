@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from typing import Optional, Literal
+from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+from app.schemas.implementation import BehaviorImplementationRead
+
+
+# -------- Test a single implementation in Podman --------
 
 
 class TestImplementationRequest(BaseModel):
-    implementation_id: int = Field(
-        ...,
-        description="ID of BehaviorImplementation to test in a Podman container.",
-    )
+    implementation_id: int
 
 
 class TestImplementationResponse(BaseModel):
@@ -21,48 +23,48 @@ class TestImplementationResponse(BaseModel):
     elapsed_seconds: float
 
 
-class DeployRequest(BaseModel):
-    # Option A: use an existing BehaviorImplementation id
-    implementation_id: Optional[int] = Field(
-        default=None,
-        description=(
-            "If provided, repo_url / revision / language are inferred from this "
-            "BehaviorImplementation."
-        ),
-    )
-
-    # Option B: raw GitHub info
-    repo_url: Optional[str] = Field(
-        default=None,
-        description="Git clone URL for the repo (if not using implementation_id).",
-    )
-    revision: Optional[str] = Field(
-        default="main",
-        description="Git branch or revision to deploy.",
-    )
-    language: Optional[str] = Field(
-        default=None,
-        description="Language for selecting the adapter (if not using implementation_id).",
-    )
-
-    command_override: Optional[str] = Field(
-        default=None,
-        description="Optional shell command to run as the service, overrides adapter default.",
-    )
-    host_port: Optional[int] = Field(
-        default=None,
-        description="Host port to expose (optional).",
-    )
-    container_port: Optional[int] = Field(
-        default=None,
-        description="Container service port (optional).",
-    )
+# -------- Build legacy harness repo (separate tests repo) --------
 
 
-class DeployResponse(BaseModel):
-    container_id: str
-    container_image: str
-    repo_url: str
-    revision: str
+class BuildLegacyHarnessRequest(BaseModel):
+    behavior_id: int
     language: str
+    contract_id: Optional[int] = None
+    target_repo_name: Optional[str] = None
+
+
+class BuildLegacyHarnessResponse(BaseModel):
+    harness: BehaviorImplementationRead
+
+
+# -------- Run legacy code + harness together in Podman --------
+
+
+class RunLegacyWithHarnessRequest(BaseModel):
+    legacy_implementation_id: int
+    harness_implementation_id: int
+    # Optional override; normally inferred from implementations
+    behavior_id: Optional[int] = None
+    contract_id: Optional[int] = None
+
+
+class RunLegacyWithHarnessResponse(BaseModel):
+    legacy_implementation_id: int
+    harness_implementation_id: int
+    exit_code: int
+    stdout: str
+    stderr: str
+    container_image: str
     elapsed_seconds: float
+
+
+# -------- NEW: Build converted tests in the converted repo --------
+
+
+class BuildConvertedTestsRequest(BaseModel):
+    implementation_id: int
+    contract_id: Optional[int] = None
+
+
+class BuildConvertedTestsResponse(BaseModel):
+    implementation: BehaviorImplementationRead
