@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 import asyncio
 import time
@@ -40,6 +41,7 @@ class PodmanRuntimeError(RuntimeError):
             return base + "\n" + "\n".join(parts)
         return base
 
+
 @dataclass
 class PodmanExecResult:
     stdout: str
@@ -60,29 +62,51 @@ class PodmanResult:
     elapsed_seconds: float
 
 
+# ---------- Container runtime configuration ----------
+
+# Allow overriding the container runtime (podman or docker) via env var.
+# Default is "podman", per your current design.
+PODMAN_BIN = os.getenv("MLBE_CONTAINER_BIN", "podman")
+
+
 # ---------- Low-level podman wrapper ----------
 
 
 async def run_podman(args: List[str], cwd: Optional[Path] = None) -> PodmanExecResult:
     """
-    Run a `podman` command and raise PodmanRuntimeError on non-zero exit.
+    Run the configured container runtime (PODMAN_BIN) with the given args.
 
-    Returns captured stdout/stderr on success.
+    - Uses PODMAN_BIN (e.g. "podman", "/opt/podman/bin/podman", or "docker")
+    - Captures stdout/stderr.
+    - Raises PodmanRuntimeError on non-zero exit or if the binary is missing.
     """
-    proc = await asyncio.create_subprocess_exec(
-        "podman",
-        *args,
-        cwd=str(cwd) if cwd is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            PODMAN_BIN,
+            *args,
+            cwd=str(cwd) if cwd is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        # This is the [Errno 2] case you were seeing before. We convert it to a
+        # clear PodmanRuntimeError so the API response is more informative.
+        raise PodmanRuntimeError(
+            (
+                f"Container runtime '{PODMAN_BIN}' not found. "
+                "Install Podman (or Docker) and ensure it is on PATH for the backend "
+                "process, or set MLBE_CONTAINER_BIN to the full path of the binary "
+                "(e.g. /opt/podman/bin/podman) and restart the backend."
+            )
+        ) from exc
+
     stdout_b, stderr_b = await proc.communicate()
     stdout = stdout_b.decode()
     stderr = stderr_b.decode()
 
     if proc.returncode != 0:
         raise PodmanRuntimeError(
-            f"podman {' '.join(args)} failed with exit {proc.returncode}",
+            f"{PODMAN_BIN} {' '.join(args)} failed with exit {proc.returncode}",
             stdout=stdout,
             stderr=stderr,
             exit_code=proc.returncode,
@@ -135,7 +159,7 @@ def _with_github_token(repo_url: str) -> str:
     prefix = "https://github.com/"
     if repo_url.startswith(prefix):
         # https://github.com/OWNER/REPO(.git)? -> https://TOKEN@github.com/OWNER/REPO(.git)?
-        rest = repo_url[len("https://") :]  # "github.com/OWNER/REPO..."
+        rest = repo_url[len("https://"):]  # "github.com/OWNER/REPO..."
         return f"https://{token}@" + rest
 
     # If it's already an https://token@github.com/... style URL, just return it.
@@ -206,66 +230,6 @@ async def clone_or_update_repo(
 
     return repo_path
 
-async def clone_or_update_repo(
-    repo_url: str,
-    base_dir: Path,
-    revision: str,
-) -> Path:
-    """
-    Simple, self-contained clone/update helper for runtime use.
-
-    - Accepts either HTML or .git-style URLs.
-    - If repo directory exists:
-        git fetch; git checkout <revision>; git pull --ff-only origin <revision>
-    - Else:
-        git clone <repo_url> <dir>; git checkout <revision>
-    """
-    base_dir.mkdir(parents=True, exist_ok=True)
-
-    # Normalize clone URL: if it doesn't end with .git, append it.
-    clone_url = repo_url.rstrip("/")
-    if not clone_url.endswith(".git"):
-        clone_url = clone_url + ".git"
-
-    # Derive a stable directory name from the *path* portion (without .git)
-    repo_name = clone_url.rsplit("/", 1)[-1]
-    if repo_name.endswith(".git"):
-        repo_name = repo_name[:-4]
-
-    repo_path = base_dir / repo_name
-
-    if repo_path.exists():
-        # Update existing clone
-        await _run_git(["fetch", "origin"], cwd=repo_path)
-        await _run_git(["checkout", revision], cwd=repo_path)
-        await _run_git(["pull", "--ff-only", "origin", revision], cwd=repo_path)
-    else:
-        # New clone
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "clone",
-            clone_url,
-            str(repo_path),
-            cwd=str(base_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_b, stderr_b = await proc.communicate()
-        stdout = stdout_b.decode()
-        stderr = stderr_b.decode()
-        if proc.returncode != 0:
-            raise PodmanRuntimeError(
-                f"git clone failed with exit {proc.returncode}",
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=proc.returncode,
-            )
-
-        # Checkout requested revision (branch/tag/commit)
-        await _run_git(["checkout", revision], cwd=repo_path)
-
-    return repo_path
-
 
 # ---------- High-level helpers used by FastAPI routes ----------
 
@@ -275,7 +239,7 @@ async def run_tests_for_implementation(
     implementation_id: int,
 ) -> PodmanResult:
     """
-    Run tests for a single BehaviorImplementation in an ephemeral Podman container.
+    Run tests for a single BehaviorImplementation in an ephemeral container.
 
     Uses the LanguageAdapter's docker_image + build_command + test_command.
     """
@@ -335,7 +299,7 @@ async def run_tests_for_implementation(
         exec_res = await run_podman(full_args, cwd=None)
     except PodmanRuntimeError as exc:
         elapsed = time.monotonic() - t0
-        # Re-raise with same info but include image
+        # Re-raise with same info but include context about the implementation
         raise PodmanRuntimeError(
             f"Runtime test failed for implementation {implementation_id}: {exc}",
             stdout=exc.stdout,

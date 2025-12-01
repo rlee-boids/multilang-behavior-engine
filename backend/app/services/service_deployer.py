@@ -3,8 +3,6 @@ from __future__ import annotations
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from app.services.podman_runner import PodmanRuntimeError
-from app.services.podman_runner import clone_or_update_repo
 
 from typing import Optional
 
