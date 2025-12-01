@@ -14,6 +14,8 @@ from app.schemas.runtime import (
     RunLegacyWithHarnessResponse,
     BuildConvertedTestsRequest,
     BuildConvertedTestsResponse,
+    DeployServiceRequest,
+    DeployServiceResponse,
 )
 from app.services.podman_runner import (
     run_tests_for_implementation,
@@ -27,6 +29,10 @@ from app.services.test_harness_builder import (
 from app.services.converted_tests_builder import (
     build_converted_tests_for_implementation,
     ConvertedTestsError,
+)
+from app.services.service_deployer import (
+    deploy_behavior_service,
+    ServiceDeploymentError,
 )
 
 router = APIRouter(prefix="/runtime", tags=["runtime"])
@@ -130,7 +136,7 @@ async def run_legacy_with_harness_route(
     )
 
 
-# ---------- NEW: Build converted tests inside converted repo ----------
+# ---------- Build converted tests inside converted repo ----------
 
 
 @router.post("/build-converted-tests", response_model=BuildConvertedTestsResponse)
@@ -163,4 +169,44 @@ async def build_converted_tests(
 
     return BuildConvertedTestsResponse(
         implementation=BehaviorImplementationRead.model_validate(impl)
+    )
+
+
+# ---------- Deploy a behavior implementation as a service ----------
+
+
+@router.post("/deploy-service", response_model=DeployServiceResponse)
+async def deploy_service(
+    req: DeployServiceRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Build & run a containerized service for a UI-style BehaviorImplementation.
+
+    For now this supports:
+      - Perl CGI UI (cgi-bin/plot_ui.cgi) wrapped as PSGI via Plack.
+    """
+    try:
+        result = await deploy_behavior_service(
+            db=db,
+            implementation_id=req.implementation_id,
+            # host_port is optional; let the service choose default (18000 + impl_id)
+            # If you later extend DeployServiceRequest with host_port, you can pass it here.
+        )
+    except ServiceDeploymentError as exc:
+        raise HTTPException(status_code=500, detail=f"Service deployment failed: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Service deployment failed: {exc}")
+
+    return DeployServiceResponse(
+        implementation_id=result.implementation_id,
+        image=result.image,
+        container_name=result.container_name,
+        internal_port=result.internal_port,
+        host_port=result.host_port,
+        url=result.url,
+        build_stdout=result.build_stdout,
+        build_stderr=result.build_stderr,
+        run_stdout=result.run_stdout,
+        run_stderr=result.run_stderr,
     )

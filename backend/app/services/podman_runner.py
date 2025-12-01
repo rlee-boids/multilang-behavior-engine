@@ -1,25 +1,58 @@
 from __future__ import annotations
-
-import shutil
-import subprocess
+import os
+import asyncio
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from sqlalchemy.orm import Session
 
-from app.adapters import get_adapter
 from app.core.config import settings
 from app.models.behavior_implementation import BehaviorImplementation
+from app.adapters import get_adapter
 
 
-class PodmanRuntimeError(Exception):
-    """Errors raised when running code in Podman containers."""
+class PodmanRuntimeError(RuntimeError):
+    """
+    Raised when a Podman or git command fails.
+
+    Carries stdout/stderr/exit_code so callers (and HTTP error responses)
+    can surface useful debugging info.
+    """
+
+    def __init__(self, message: str, stdout: str = "", stderr: str = "", exit_code: int | None = None) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exit_code = exit_code
+
+    def __str__(self) -> str:
+        base = super().__str__()
+        parts: list[str] = []
+        if self.exit_code is not None:
+            parts.append(f"exit_code={self.exit_code}")
+        if self.stdout:
+            parts.append("stdout:\n" + self.stdout)
+        if self.stderr:
+            parts.append("stderr:\n" + self.stderr)
+        if parts:
+            return base + "\n" + "\n".join(parts)
+        return base
+
+@dataclass
+class PodmanExecResult:
+    stdout: str
+    stderr: str
+    exit_code: int
 
 
 @dataclass
-class PodmanRuntimeResult:
+class PodmanResult:
+    """
+    Higher-level result used by runtime endpoints.
+    """
+
     exit_code: int
     stdout: str
     stderr: str
@@ -27,266 +60,397 @@ class PodmanRuntimeResult:
     elapsed_seconds: float
 
 
-# Base directory on the host where we clone repos for runtime testing
-RUNTIME_ROOT = Path("workspace/runtime").resolve()
+# ---------- Low-level podman wrapper ----------
 
 
-def _ensure_runtime_root() -> Path:
-    RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
-    return RUNTIME_ROOT
-
-
-def _get_implementation(db: Session, implementation_id: int) -> BehaviorImplementation:
-    impl = db.get(BehaviorImplementation, implementation_id)
-    if not impl:
-        raise PodmanRuntimeError(
-            f"BehaviorImplementation {implementation_id} not found"
-        )
-    if not impl.repo_url:
-        raise PodmanRuntimeError(
-            f"BehaviorImplementation {implementation_id} has no repo_url"
-        )
-    return impl
-
-
-def _clone_or_update_repo(repo_url: str, revision: Optional[str], dest: Path) -> None:
+async def run_podman(args: List[str], cwd: Optional[Path] = None) -> PodmanExecResult:
     """
-    Clone or update a git repo into dest.
+    Run a `podman` command and raise PodmanRuntimeError on non-zero exit.
 
-    - If dest does not exist: git clone --depth=1 --branch <rev or main> <url> dest
-    - If dest exists and is a git repo: git fetch && git checkout <rev or main>
+    Returns captured stdout/stderr on success.
     """
-    dest_parent = dest.parent
-    dest_parent.mkdir(parents=True, exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        "podman",
+        *args,
+        cwd=str(cwd) if cwd is not None else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    stdout = stdout_b.decode()
+    stderr = stderr_b.decode()
 
-    branch = revision or "main"
+    if proc.returncode != 0:
+        raise PodmanRuntimeError(
+            f"podman {' '.join(args)} failed with exit {proc.returncode}",
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=proc.returncode,
+        )
 
-    if not dest.exists():
-        # Fresh clone
-        cmd = [
+    return PodmanExecResult(stdout=stdout, stderr=stderr, exit_code=proc.returncode)
+
+
+# ---------- Local git helpers (self-contained) ----------
+
+
+async def _run_git(args: list[str], cwd: Path) -> None:
+    """
+    Run a git command and raise PodmanRuntimeError on failure.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    stdout = stdout_b.decode()
+    stderr = stderr_b.decode()
+    if proc.returncode != 0:
+        raise PodmanRuntimeError(
+            f"git {' '.join(args)} failed with exit {proc.returncode}",
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=proc.returncode,
+        )
+
+
+def _with_github_token(repo_url: str) -> str:
+    """
+    Inject a GitHub token into HTTPS URL if available.
+
+    Supports private repos like:
+      https://github.com/rlee-boids/private-repo(.git)?
+    """
+    token = (
+        os.getenv("GITHUB_TOKEN")
+        or os.getenv("GH_TOKEN")
+        or os.getenv("GITHUB_PAT")
+    )
+    if not token:
+        return repo_url
+
+    prefix = "https://github.com/"
+    if repo_url.startswith(prefix):
+        # https://github.com/OWNER/REPO(.git)? -> https://TOKEN@github.com/OWNER/REPO(.git)?
+        rest = repo_url[len("https://") :]  # "github.com/OWNER/REPO..."
+        return f"https://{token}@" + rest
+
+    # If it's already an https://token@github.com/... style URL, just return it.
+    return repo_url
+
+
+async def clone_or_update_repo(
+    repo_url: str,
+    base_dir: Path,
+    revision: str,
+) -> Path:
+    """
+    Simple, self-contained clone/update helper for runtime use.
+
+    - Accepts either HTML or .git-style URLs.
+    - Injects GitHub token into URL if present (for private repos).
+    - If repo directory exists:
+        git fetch; git checkout <revision>; git pull --ff-only origin <revision>
+    - Else:
+        git clone <repo_url> <dir>; git checkout <revision>
+    """
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Normalize to .git URL
+    raw_url = repo_url.rstrip("/")
+    if not raw_url.endswith(".git"):
+        raw_url = raw_url + ".git"
+
+    # Add token if available
+    clone_url = _with_github_token(raw_url)
+
+    # Derive repo dir name from the *path* portion (strip .git)
+    repo_name = raw_url.rsplit("/", 1)[-1]
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+
+    repo_path = base_dir / repo_name
+
+    if repo_path.exists():
+        # Update existing clone
+        await _run_git(["fetch", "origin"], cwd=repo_path)
+        await _run_git(["checkout", revision], cwd=repo_path)
+        await _run_git(["pull", "--ff-only", "origin", revision], cwd=repo_path)
+    else:
+        # New clone
+        proc = await asyncio.create_subprocess_exec(
             "git",
             "clone",
-            "--depth",
-            "1",
-            "--branch",
-            branch,
-            repo_url,
-            str(dest),
-        ]
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            clone_url,
+            str(repo_path),
+            cwd=str(base_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        stdout_b, stderr_b = await proc.communicate()
+        stdout = stdout_b.decode()
+        stderr = stderr_b.decode()
         if proc.returncode != 0:
             raise PodmanRuntimeError(
-                f"git clone failed for {repo_url}@{branch}: {proc.stderr}"
+                f"git clone failed with exit {proc.returncode}",
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=proc.returncode,
             )
-        return
 
-    # Existing dir -> try to update if it's a git repo
-    if not (dest / ".git").exists():
-        # Not a git repo; blow it away and reclone
-        shutil.rmtree(dest)
-        _clone_or_update_repo(repo_url, revision, dest)
-        return
+        # Checkout requested revision (branch/tag/commit)
+        await _run_git(["checkout", revision], cwd=repo_path)
 
-    # git fetch + checkout
-    cmd_fetch = ["git", "-C", str(dest), "fetch", "--all", "--prune"]
-    proc_fetch = subprocess.run(
-        cmd_fetch,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc_fetch.returncode != 0:
-        raise PodmanRuntimeError(
-            f"git fetch failed for {repo_url}: {proc_fetch.stderr}"
-        )
+    return repo_path
 
-    cmd_checkout = ["git", "-C", str(dest), "checkout", branch]
-    proc_checkout = subprocess.run(
-        cmd_checkout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc_checkout.returncode != 0:
-        raise PodmanRuntimeError(
-            f"git checkout {branch} failed for {repo_url}: {proc_checkout.stderr}"
-        )
-
-    cmd_reset = ["git", "-C", str(dest), "reset", "--hard", f"origin/{branch}"]
-    proc_reset = subprocess.run(
-        cmd_reset,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc_reset.returncode != 0:
-        raise PodmanRuntimeError(
-            f"git reset failed for {repo_url}: {proc_reset.stderr}"
-        )
-
-
-def _run_podman(
-    image: str,
-    workdir_in_container: str,
-    volumes: list[tuple[Path, str]],
-    inner_cmd: str,
-) -> PodmanRuntimeResult:
+async def clone_or_update_repo(
+    repo_url: str,
+    base_dir: Path,
+    revision: str,
+) -> Path:
     """
-    Run a single Podman container with:
+    Simple, self-contained clone/update helper for runtime use.
 
-    - image: container image name
-    - workdir_in_container: working directory inside container
-    - volumes: list of (host_path, container_path) tuples
-    - inner_cmd: shell command to run via `sh -lc`
+    - Accepts either HTML or .git-style URLs.
+    - If repo directory exists:
+        git fetch; git checkout <revision>; git pull --ff-only origin <revision>
+    - Else:
+        git clone <repo_url> <dir>; git checkout <revision>
     """
-    runtime_bin = settings.CONTAINER_RUNTIME or "podman"
+    base_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build volume args
-    volume_args: list[str] = []
-    for host, container in volumes:
-        volume_args.extend(
-            [
-                "-v",
-                f"{host.resolve()}:{container}",
-            ]
+    # Normalize clone URL: if it doesn't end with .git, append it.
+    clone_url = repo_url.rstrip("/")
+    if not clone_url.endswith(".git"):
+        clone_url = clone_url + ".git"
+
+    # Derive a stable directory name from the *path* portion (without .git)
+    repo_name = clone_url.rsplit("/", 1)[-1]
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+
+    repo_path = base_dir / repo_name
+
+    if repo_path.exists():
+        # Update existing clone
+        await _run_git(["fetch", "origin"], cwd=repo_path)
+        await _run_git(["checkout", revision], cwd=repo_path)
+        await _run_git(["pull", "--ff-only", "origin", revision], cwd=repo_path)
+    else:
+        # New clone
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "clone",
+            clone_url,
+            str(repo_path),
+            cwd=str(base_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        stdout_b, stderr_b = await proc.communicate()
+        stdout = stdout_b.decode()
+        stderr = stderr_b.decode()
+        if proc.returncode != 0:
+            raise PodmanRuntimeError(
+                f"git clone failed with exit {proc.returncode}",
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=proc.returncode,
+            )
 
-    cmd = [
-        runtime_bin,
-        "run",
-        "--rm",
-        "-w",
-        workdir_in_container,
-        *volume_args,
-        image,
-        "sh",
-        "-lc",
-        inner_cmd,
-    ]
+        # Checkout requested revision (branch/tag/commit)
+        await _run_git(["checkout", revision], cwd=repo_path)
 
-    start = time.time()
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    end = time.time()
-
-    return PodmanRuntimeResult(
-        exit_code=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
-        container_image=image,
-        elapsed_seconds=end - start,
-    )
+    return repo_path
 
 
-# ---------- Public API: single implementation ----------
+# ---------- High-level helpers used by FastAPI routes ----------
 
 
 async def run_tests_for_implementation(
     db: Session,
     implementation_id: int,
-) -> PodmanRuntimeResult:
+) -> PodmanResult:
     """
-    Run tests for a single BehaviorImplementation:
+    Run tests for a single BehaviorImplementation in an ephemeral Podman container.
 
-    - Clone/update its repo into workspace/runtime/impl_<id>
-    - Use the adapter's build_command + test_command
-    - Run in Podman with the adapter's docker_image
+    Uses the LanguageAdapter's docker_image + build_command + test_command.
     """
-    impl = _get_implementation(db, implementation_id)
+    impl: Optional[BehaviorImplementation] = (
+        db.query(BehaviorImplementation)
+        .filter(BehaviorImplementation.id == implementation_id)
+        .one_or_none()
+    )
+    if impl is None:
+        raise PodmanRuntimeError(f"BehaviorImplementation id={implementation_id} not found")
+
+    if not impl.repo_url:
+        raise PodmanRuntimeError(f"Implementation {implementation_id} has no repo_url set")
+
+    if not impl.language:
+        raise PodmanRuntimeError(f"Implementation {implementation_id} has no language set")
+
     adapter = get_adapter(impl.language)
 
-    _ensure_runtime_root()
-    work_dir = RUNTIME_ROOT / f"impl_{impl.id}"
-    _clone_or_update_repo(impl.repo_url, impl.revision, work_dir)
+    # Workspace where we clone the repo
+    workspace_root = Path(getattr(settings, "analyzer_workspace_root", "./workspace"))
+    workspace_root.mkdir(parents=True, exist_ok=True)
+
+    repo_root = await clone_or_update_repo(
+        repo_url=impl.repo_url,
+        base_dir=workspace_root,
+        revision=impl.revision or "main",
+    )
 
     image = adapter.docker_image
 
-    # Build inner command using adapter hooks; we expect these to be shell snippets
-    build_cmd = adapter.build_command("/workspace")
-    test_cmd = adapter.test_command("/workspace")
+    # Build + test command inside the container
+    build_cmd = adapter.build_command("/code")
+    test_cmd = adapter.test_command("/code")
 
+    parts: list[str] = []
     if build_cmd:
-        inner_cmd = f"{build_cmd} && {test_cmd}"
-    else:
-        inner_cmd = test_cmd
+        parts.append(str(build_cmd))
+    parts.append(str(test_cmd))
+    joined_cmd = " && ".join(parts)
 
-    result = _run_podman(
-        image=image,
-        workdir_in_container="/workspace",
-        volumes=[(work_dir, "/workspace")],
-        inner_cmd=inner_cmd,
+    full_args = [
+        "run",
+        "--rm",
+        "-v",
+        f"{repo_root}:/code",
+        "-w",
+        "/code",
+        image,
+        "/bin/sh",
+        "-lc",
+        joined_cmd,
+    ]
+
+    t0 = time.monotonic()
+    try:
+        exec_res = await run_podman(full_args, cwd=None)
+    except PodmanRuntimeError as exc:
+        elapsed = time.monotonic() - t0
+        # Re-raise with same info but include image
+        raise PodmanRuntimeError(
+            f"Runtime test failed for implementation {implementation_id}: {exc}",
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            exit_code=exc.exit_code,
+        ) from exc
+
+    elapsed = time.monotonic() - t0
+    return PodmanResult(
+        exit_code=exec_res.exit_code,
+        stdout=exec_res.stdout,
+        stderr=exec_res.stderr,
+        container_image=image,
+        elapsed_seconds=elapsed,
     )
-
-    return result
-
-
-# ---------- Public API: legacy + harness together ----------
 
 
 async def run_legacy_with_harness(
     db: Session,
     legacy_implementation_id: int,
     harness_implementation_id: int,
-    behavior_id: Optional[int] = None,
-    contract_id: Optional[int] = None,
-) -> PodmanRuntimeResult:
+    behavior_id: int,
+    contract_id: int | None,
+) -> PodmanResult:
     """
-    Run legacy implementation + separate harness repo together in Podman.
+    Run legacy code + harness tests inside a paired container setup.
 
     Layout inside the container:
-      /code   -> legacy repo
-      /tests  -> harness repo (working dir)
+      /code  -> legacy repo
+      /tests -> harness repo (working dir)
 
-    The language adapter provides a `run_contract_test_command` which is
-    executed with project_root="/tests".
+    Uses the LanguageAdapter.run_contract_test_command to construct the test command.
     """
-    legacy_impl = _get_implementation(db, legacy_implementation_id)
-    harness_impl = _get_implementation(db, harness_implementation_id)
+    legacy_impl: Optional[BehaviorImplementation] = (
+        db.query(BehaviorImplementation)
+        .filter(BehaviorImplementation.id == legacy_implementation_id)
+        .one_or_none()
+    )
+    if legacy_impl is None:
+        raise PodmanRuntimeError(f"Legacy BehaviorImplementation id={legacy_implementation_id} not found")
 
-    if legacy_impl.behavior_id != harness_impl.behavior_id:
-        # Allow caller to override, but warn by failing here if they mismatch.
+    harness_impl: Optional[BehaviorImplementation] = (
+        db.query(BehaviorImplementation)
+        .filter(BehaviorImplementation.id == harness_implementation_id)
+        .one_or_none()
+    )
+    if harness_impl is None:
+        raise PodmanRuntimeError(f"Harness BehaviorImplementation id={harness_implementation_id} not found")
+
+    if legacy_impl.language != harness_impl.language:
         raise PodmanRuntimeError(
-            f"Legacy implementation behavior_id={legacy_impl.behavior_id} "
-            f"differs from harness behavior_id={harness_impl.behavior_id}"
+            f"Language mismatch: legacy={legacy_impl.language}, harness={harness_impl.language}"
         )
 
-    behavior_id = behavior_id or legacy_impl.behavior_id
+    if not legacy_impl.repo_url:
+        raise PodmanRuntimeError(f"Legacy implementation {legacy_implementation_id} has no repo_url set")
+    if not harness_impl.repo_url:
+        raise PodmanRuntimeError(f"Harness implementation {harness_implementation_id} has no repo_url set")
 
-    adapter = get_adapter(legacy_impl.language)
+    language = legacy_impl.language
+    adapter = get_adapter(language)
+
+    workspace_root = Path(getattr(settings, "analyzer_workspace_root", "./workspace"))
+    workspace_root.mkdir(parents=True, exist_ok=True)
+
+    legacy_root = await clone_or_update_repo(
+        repo_url=legacy_impl.repo_url,
+        base_dir=workspace_root,
+        revision=legacy_impl.revision or "main",
+    )
+    harness_root = await clone_or_update_repo(
+        repo_url=harness_impl.repo_url,
+        base_dir=workspace_root,
+        revision=harness_impl.revision or "main",
+    )
+
     image = adapter.docker_image
-
-    _ensure_runtime_root()
-
-    legacy_dir = RUNTIME_ROOT / f"legacy_{legacy_impl.id}"
-    harness_dir = RUNTIME_ROOT / f"harness_{harness_impl.id}"
-
-    _clone_or_update_repo(legacy_impl.repo_url, legacy_impl.revision, legacy_dir)
-    _clone_or_update_repo(harness_impl.repo_url, harness_impl.revision, harness_dir)
-
-    # Let the adapter define the exact test command using the contract semantics
-    inner_cmd = adapter.run_contract_test_command(
+    test_cmd = adapter.run_contract_test_command(
         behavior_id=behavior_id,
         contract_id=contract_id,
         project_root="/tests",
     )
 
-    result = _run_podman(
-        image=image,
-        workdir_in_container="/tests",
-        volumes=[
-            (legacy_dir, "/code"),
-            (harness_dir, "/tests"),
-        ],
-        inner_cmd=inner_cmd,
-    )
+    full_args = [
+        "run",
+        "--rm",
+        "-v",
+        f"{legacy_root}:/code",
+        "-v",
+        f"{harness_root}:/tests",
+        "-w",
+        "/tests",
+        image,
+        "/bin/sh",
+        "-lc",
+        str(test_cmd),
+    ]
 
-    return result
+    t0 = time.monotonic()
+    try:
+        exec_res = await run_podman(full_args, cwd=None)
+    except PodmanRuntimeError as exc:
+        elapsed = time.monotonic() - t0
+        raise PodmanRuntimeError(
+            f"Legacy+harness test failed: {exc}",
+            stdout=exc.stdout,
+            stderr=exc.stderr,
+            exit_code=exc.exit_code,
+        ) from exc
+
+    elapsed = time.monotonic() - t0
+    return PodmanResult(
+        exit_code=exec_res.exit_code,
+        stdout=exec_res.stdout,
+        stderr=exec_res.stderr,
+        container_image=image,
+        elapsed_seconds=elapsed,
+    )

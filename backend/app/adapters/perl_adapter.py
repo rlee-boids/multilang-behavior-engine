@@ -1,11 +1,12 @@
+# app/adapters/perl_adapter.py
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Union
 
-from app.adapters.base import LanguageAdapter
+from app.adapters.base import LanguageAdapter, ServiceHarnessInfo
 
 
 class PerlAdapter(LanguageAdapter):
@@ -17,11 +18,12 @@ class PerlAdapter(LanguageAdapter):
     - Provide container image for Podman
     - Provide build + test commands
     - Provide hooks for contract-based test generation and skeleton generation
+    - Provide a minimal PSGI service harness for deployment
     """
 
     # Adapter identity
     name: str = "perl"
-    file_extensions: List[str] = [".pl", ".pm"]
+    file_extensions: List[str] = [".pl", ".pm", ".cgi", ".plx", ".pls", ".psgi", ".fcgi"]
     # Official Perl image; has `prove` available.
     docker_image: str = "perl:5.38"
 
@@ -36,7 +38,7 @@ class PerlAdapter(LanguageAdapter):
             return True
 
         if p.is_dir():
-            # Any .pl/.pm under this directory
+            # Any .pl/.pm/.cgi under this directory
             for child in p.rglob("*"):
                 if child.suffix in self.file_extensions:
                     return True
@@ -271,6 +273,87 @@ done_testing();
         lines.append("")
 
         file_path.write_text("\n".join(lines))
+
+    # ---------- NEW: service harness generation ----------
+
+    def generate_service_harness(
+        self,
+        behavior,
+        implementation,
+        contract,
+        repo_root: Path,
+    ) -> ServiceHarnessInfo:
+        """
+        Generate a PSGI service harness for this implementation.
+
+        For now, we focus on CGI-based UIs like cgi-bin/plot_ui.cgi:
+          - app.psgi wraps the CGI script using CGI::Compile + CGI::Emulate::PSGI.
+          - Dockerfile installs Plack and CGI glue, exposes port 5000, and runs plackup.
+
+        Later we can add a JSON->run(%args) style harness for non-CGI modules.
+        """
+        repo_root = Path(repo_root)
+
+        file_path_str = getattr(implementation, "file_path", "") or ""
+        if not file_path_str:
+            # Default to your plotting CGI; caller should usually pass a real file_path.
+            cgi_rel = "cgi-bin/plot_ui.cgi"
+        else:
+            cgi_rel = file_path_str
+
+        # Normalize to POSIX-style path for literal Perl string
+        cgi_posix = str(PurePosixPath(cgi_rel))
+
+        app_psgi = repo_root / "app.psgi"
+        app_psgi_contents = f"""use strict;
+use warnings;
+use FindBin;
+use lib "$FindBin::Bin/lib";
+
+use CGI::Compile;
+use CGI::Emulate::PSGI;
+
+# Wrap the legacy CGI script:
+my $cgi_app = CGI::Compile->compile("{cgi_posix}");
+my $app     = CGI::Emulate::PSGI->handler($cgi_app);
+
+# Plack expects to see a PSGI app in $_[0]:
+$app;
+"""
+        app_psgi.write_text(app_psgi_contents)
+
+        dockerfile_path = repo_root / "Dockerfile"
+        dockerfile_contents = f"""FROM {self.docker_image}
+
+WORKDIR /app
+COPY . /app
+
+# Install dependencies for plotting + PSGI
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends \\
+        cpanminus \\
+        libgd-dev \\
+    && cpanm --notest \\
+        GD::Graph \\
+        JSON \\
+        File::Slurp \\
+        Plack \\
+        CGI::Emulate::PSGI \\
+        CGI::Compile \\
+    && apt-get clean \\
+    && rm -rf /var/lib/apt/lists/*
+
+EXPOSE 5000
+
+CMD ["plackup", "-Ilib", "-p", "5000", "app.psgi"]
+"""
+        dockerfile_path.write_text(dockerfile_contents)
+
+        return ServiceHarnessInfo(
+            context_dir=repo_root,
+            dockerfile_path=dockerfile_path,
+            internal_port=5000,
+        )
 
 
 perl_adapter = PerlAdapter()

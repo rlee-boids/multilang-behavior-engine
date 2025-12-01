@@ -1,11 +1,12 @@
+# app/adapters/python_adapter.py
 from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Union
 
-from app.adapters.base import LanguageAdapter
+from app.adapters.base import LanguageAdapter, ServiceHarnessInfo
 
 
 class PythonAdapter(LanguageAdapter):
@@ -17,6 +18,7 @@ class PythonAdapter(LanguageAdapter):
     - Provide container image for Podman
     - Provide build + test commands
     - Provide hooks for contract-based test generation and skeleton generation
+    - Provide a minimal FastAPI service harness for deployment
     """
 
     name: str = "python"
@@ -284,6 +286,125 @@ def test_contract_case(case):
         lines.append("")
 
         file_path.write_text("\n".join(lines))
+
+    # ---------- NEW: service harness generation ----------
+
+    def generate_service_harness(
+        self,
+        behavior,
+        implementation,
+        contract,
+        repo_root: Path,
+    ) -> ServiceHarnessInfo:
+        """
+        Generate a minimal FastAPI service for this implementation.
+
+        - Derives module path from implementation.file_path (e.g. lib/Plot/Generator.py).
+        - Creates app/main.py that imports that module and calls `run(**params)`.
+        - Writes a Dockerfile that installs FastAPI + Uvicorn and exposes port 8000.
+        """
+        repo_root = Path(repo_root)
+
+        # Derive module path from implementation.file_path, e.g.:
+        #   "lib/Plot/Generator.py" -> "lib.Plot.Generator"
+        file_path_str = getattr(implementation, "file_path", "") or ""
+        if not file_path_str:
+            # Fallback to a generic module name; service will just say "not wired"
+            module_path = "behavior_module"
+        else:
+            p = PurePosixPath(file_path_str)
+            parts = list(p.with_suffix("").parts)
+            module_path = ".".join(parts) if parts else "behavior_module"
+
+        impl_name = getattr(behavior, "name", f"behavior_{behavior.id}")
+        app_dir = repo_root / "app"
+        app_dir.mkdir(parents=True, exist_ok=True)
+
+        # Ensure package structure
+        (app_dir / "__init__.py").write_text("")
+
+        main_py = f"""from __future__ import annotations
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from importlib import import_module
+from typing import Any, Dict
+
+APP_TITLE = "MLBE Service - {impl_name}"
+MODULE_PATH = {module_path!r}
+ATTR_NAME = "run"
+
+
+app = FastAPI(title=APP_TITLE)
+
+
+class InvokeRequest(BaseModel):
+    params: Dict[str, Any] = {{}}
+
+
+def _load_impl():
+    try:
+        mod = import_module(MODULE_PATH)
+    except ImportError as exc:
+        raise RuntimeError(f"Cannot import {{MODULE_PATH}}: {{exc}}") from exc
+
+    func = getattr(mod, ATTR_NAME, None)
+    if func is None:
+        raise RuntimeError(
+            f"Module {{MODULE_PATH}} does not define a callable '{{ATTR_NAME}}'"
+        )
+    if not callable(func):
+        raise RuntimeError(
+            f"Attribute '{{ATTR_NAME}}' on module {{MODULE_PATH}} is not callable"
+        )
+    return func
+
+
+@app.post("/invoke")
+def invoke(req: InvokeRequest):
+    \"\"\"Generic invocation endpoint.
+
+    Expects:
+      {{
+        "params": {{ ... kwargs for run(...) ... }}
+      }}
+    \"\"\"
+    try:
+        func = _load_impl()
+        result = func(**(req.params or {{}}))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {{"result": result}}
+
+
+@app.get("/")
+def health():
+    return {{"status": "ok", "module": MODULE_PATH, "attr": ATTR_NAME}}
+"""
+        (app_dir / "main.py").write_text(main_py)
+
+        # Dockerfile at repo_root
+        dockerfile_path = repo_root / "Dockerfile"
+        dockerfile_contents = f"""FROM {self.docker_image}
+
+WORKDIR /app
+COPY . /app
+
+# Minimal deps for FastAPI service harness
+RUN pip install --no-cache-dir fastapi uvicorn
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+"""
+        dockerfile_path.write_text(dockerfile_contents)
+
+        return ServiceHarnessInfo(
+            context_dir=repo_root,
+            dockerfile_path=dockerfile_path,
+            internal_port=8000,
+        )
 
 
 python_adapter = PythonAdapter()
