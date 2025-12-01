@@ -41,7 +41,7 @@ if podman volume ls --format '{{.Name}}' | grep -q '^mlbe-'; then
 fi
 
 echo "=== [4/4] Cleaning local workspaces (analyzer/runtime/services) ==="
-rm -rf workspace/analyzer workspace/runtime workspace/services
 rm -rf workspace
+rm -rf services_workspace
 
-echo "Reset complete ✅"
+echo "Reset complete"
