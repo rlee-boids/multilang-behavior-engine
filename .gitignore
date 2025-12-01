@@ -41,6 +41,8 @@ backend/.venv/
 # Local workspace / scratch
 workspace
 backend/workspace
+services_workspace
+backend/services_workspace/
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
