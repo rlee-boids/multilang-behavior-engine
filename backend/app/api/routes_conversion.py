@@ -9,7 +9,11 @@ from app.schemas.conversion import (
     ProjectConversionResponse,
 )
 from app.schemas.implementation import BehaviorImplementationRead
-from app.services.conversion_engine import convert_behavior_stub, ConversionError
+from app.services.conversion_engine import (
+    convert_behavior_stub,
+    convert_full_project,
+    ConversionError,
+)
 from app.services.converted_tests_builder import (
     build_converted_tests_for_implementation,
     ConvertedTestsError,
@@ -90,6 +94,7 @@ async def build_converted_tests_endpoint(
 
 
 # ---------- NEW: Whole-project conversion (convert + tests in one flow) ----------
+
 
 
 @router.post("/convert-project", response_model=ProjectConversionResponse)

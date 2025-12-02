@@ -1,9 +1,9 @@
 from __future__ import annotations
+
 import os
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -16,7 +16,11 @@ from app.services.podman_runner import (
     PodmanRuntimeError,
 )
 
-SERVICES_WORKSPACE_ROOT = Path(os.path.abspath(getattr(settings, "SERVICES_WORKSPACE_ROOT", "services_workspace")))
+# Kept for backwards compatibility if referenced elsewhere; not used directly below.
+SERVICES_WORKSPACE_ROOT = Path(
+    os.path.abspath(getattr(settings, "SERVICES_WORKSPACE_ROOT", "services_workspace"))
+)
+
 
 class ServiceDeploymentError(Exception):
     """Raised when deploying a behavior UI service fails."""
@@ -45,11 +49,10 @@ def _get_service_workspace_root() -> Path:
     root = getattr(settings, "service_workspace_root", None)
     if not root:
         root = "./services_workspace"
-    # Make this absolute so it doesn’t depend on uvicorn’s CWD
+    # Make this absolute so it doesn’t depend on uvicorn’s CWD.
     p = Path(root).resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
-
 
 
 def _render_perl_psgi_app(cgi_path: str) -> str:
@@ -70,6 +73,37 @@ def _render_perl_psgi_app(cgi_path: str) -> str:
         );
 
         $app;
+        """
+    )
+
+
+def _render_python_ui_dockerfile(entrypoint: str) -> str:
+    """
+    Dockerfile for running a Python-based UI.
+
+    `entrypoint` is taken from BehaviorImplementation.file_path, e.g.:
+      - "app/ui/plot_ui.py"
+      - "cgi-bin/plot_ui.py"
+    We simply run `python <entrypoint>`.
+    """
+    # Normalize to POSIX-style path just in case
+    entrypoint = entrypoint.replace("\\\\", "/") or "app/ui/plot_ui.py"
+
+    return textwrap.dedent(
+        f"""\
+        FROM python:3.12-slim
+        WORKDIR /app
+        COPY . /app
+
+        # Install dependencies if requirements.txt present
+        RUN if [ -f requirements.txt ]; then \\
+                pip install --no-cache-dir -r requirements.txt; \\
+            fi
+
+        EXPOSE 8000
+
+        # Run the converted UI entrypoint
+        CMD ["python", "{entrypoint}"]
         """
     )
 
@@ -131,16 +165,25 @@ async def deploy_behavior_service(
     """
     Deploy a UI/service for a given BehaviorImplementation.
 
-    For now, only Perl CGI/PSGI UIs are supported:
-      - impl.language == 'perl'
-      - impl.file_path points to a CGI script (e.g. 'cgi-bin/plot_ui.cgi')
+    Supported for now:
+      - Perl CGI/PSGI UIs:
+          impl.language == 'perl'
+          impl.file_path points to a CGI script (e.g. 'cgi-bin/plot_ui.cgi')
+      - Python UIs:
+          impl.language == 'python'
+          impl.file_path points to the converted UI entrypoint
+          (e.g. 'app/ui/plot_ui.py' or 'cgi-bin/plot_ui.py')
 
     Flow:
-      1. Clone or update the legacy UI repo into the service workspace.
-      2. Write app.psgi at the repo root that wraps the CGI script.
-      3. Write a Dockerfile for a plackup-based Perl PSGI service.
-      4. Build image:  mlbe-svc-<language>-impl-<id>
-      5. Run container: mlbe-svc-<id>, port host_port:5000
+      1. Clone or update the UI repo into the service workspace.
+      2. For Perl:
+           - Write app.psgi that wraps the CGI script.
+           - Write a Dockerfile for a plackup-based Perl PSGI service.
+         For Python:
+           - Write a Dockerfile that runs the converted Python UI entrypoint.
+      3. Build image:  mlbe-svc-<language>-impl-<id>
+      4. Run container: mlbe-svc-<id>,
+         mapping host_port to the appropriate internal port.
     """
     impl: Optional[BehaviorImplementation] = (
         db.query(BehaviorImplementation)
@@ -148,22 +191,22 @@ async def deploy_behavior_service(
         .one_or_none()
     )
     if impl is None:
-        raise ServiceDeploymentError(f"BehaviorImplementation id={implementation_id} not found")
+        raise ServiceDeploymentError(
+            f"BehaviorImplementation id={implementation_id} not found"
+        )
 
     if not impl.repo_url:
-        raise ServiceDeploymentError(f"Implementation {implementation_id} has no repo_url set")
+        raise ServiceDeploymentError(
+            f"Implementation {implementation_id} has no repo_url set"
+        )
 
     language = (impl.language or "").lower()
     file_path = impl.file_path or ""
 
-    if language != "perl":
+    # Only perl and python are supported for UI deployment right now.
+    if language not in ("perl", "python"):
         raise ServiceDeploymentError(
-            f"Only perl UI deployments are supported for now (got language={impl.language!r})"
-        )
-
-    if not file_path.endswith(".cgi"):
-        raise ServiceDeploymentError(
-            f"Perl UI deployment expects a CGI script (.cgi), got file_path={file_path!r}"
+            f"UI deployment not supported for language={impl.language!r}"
         )
 
     # --- 1. Clone/update repo into the service workspace ---
@@ -174,14 +217,36 @@ async def deploy_behavior_service(
         revision=impl.revision or "main",
     )
 
-    # --- 2. Write app.psgi that wraps the CGI script ---
-    app_psgi_path = repo_root / "app.psgi"
-    app_psgi_code = _render_perl_psgi_app(file_path)
-    app_psgi_path.write_text(app_psgi_code)
+    # --- 2. Language-specific setup (app.psgi, internal port, Dockerfile content) ---
+    if language == "perl":
+        # For Perl UIs we expect a CGI script.
+        if not file_path.endswith(".cgi"):
+            raise ServiceDeploymentError(
+                f"Perl UI deployment expects a CGI script (.cgi), got file_path={file_path!r}"
+            )
 
-    # --- 3. Write Dockerfile for PSGI service ---
+        # Write app.psgi that wraps the CGI script.
+        app_psgi_path = repo_root / "app.psgi"
+        app_psgi_code = _render_perl_psgi_app(file_path)
+        app_psgi_path.write_text(app_psgi_code)
+
+        dockerfile_code = _render_perl_ui_dockerfile()
+        internal_port = 5000
+
+    else:
+        # Python UI: no app.psgi, just a Dockerfile that runs the converted UI.
+        if not file_path.endswith(".py"):
+            # We can still try, but it's a strong signal something's off.
+            raise ServiceDeploymentError(
+                f"Python UI deployment expects a .py entrypoint, got file_path={file_path!r}"
+            )
+
+        dockerfile_code = _render_python_ui_dockerfile(file_path)
+        # Match EXPOSE in the Python Dockerfile
+        internal_port = 8000
+
+    # --- 3. Write Dockerfile ---
     dockerfile_path = repo_root / "Dockerfile"
-    dockerfile_code = _render_perl_ui_dockerfile()
     dockerfile_path.write_text(dockerfile_code)
 
     # --- 4. Build image ---
@@ -192,13 +257,15 @@ async def deploy_behavior_service(
         build_res = await run_podman(build_args, cwd=repo_root)
     except PodmanRuntimeError as exc:
         raise ServiceDeploymentError(
-            f"Image build failed (exit {exc.exit_code})\nstdout:\n{exc.stdout}\n\nstderr:\n{exc.stderr}\n"
+            f"Image build failed (exit {exc.exit_code})\n"
+            f"stdout:\n{exc.stdout}\n\nstderr:\n{exc.stderr}\n"
         ) from exc
 
     # --- 5. Run container ---
     container_name = f"mlbe-svc-{implementation_id}"
-    internal_port = 5000
+
     if host_port is None:
+        # Use a simple, deterministic mapping; you already used 18000+id for Perl.
         host_port = 18000 + implementation_id
 
     # Stop/remove existing container if present (ignore failure)
@@ -211,7 +278,7 @@ async def deploy_behavior_service(
     run_args = [
         "run",
         "-d",
-        "--rm",
+        #"--rm",
         "-p",
         f"{host_port}:{internal_port}",
         "--name",
@@ -223,7 +290,8 @@ async def deploy_behavior_service(
         run_res = await run_podman(run_args)
     except PodmanRuntimeError as exc:
         raise ServiceDeploymentError(
-            f"Container run failed (exit {exc.exit_code})\nstdout:\n{exc.stdout}\n\nstderr:\n{exc.stderr}\n"
+            f"Container run failed (exit {exc.exit_code})\n"
+            f"stdout:\n{exc.stdout}\n\nstderr:\n{exc.stderr}\n"
         ) from exc
 
     url = f"http://localhost:{host_port}"

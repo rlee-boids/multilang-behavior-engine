@@ -18,13 +18,13 @@ echo "=== Pipeline starting for repo: $REPO_URL @ $REVISION ==="
 # ---------------------------------------------------------------------------
 # 1) Analyze repo
 # ---------------------------------------------------------------------------
-echo "=== [1/7] Analyzing repo via /analyzer/analyze-repo ==="
+echo "=== [1/8] Analyzing repo via /analyzer/analyze-repo ==="
 ANALYZE_PAYLOAD=$(cat <<EOF
 {
   "repo_url": "$REPO_URL",
   "language": "perl",
   "revision": "$REVISION",
-  "max_files": 50,
+  "max_files": 200,
   "behavior_domain": "plotting"
 }
 EOF
@@ -38,13 +38,49 @@ curl -sS -X POST "$API_BASE/analyzer/analyze-repo" \
 echo "Analyze response saved to $ANALYZE_JSON"
 cat "$ANALYZE_JSON"
 
-# Extract key IDs using jq
-UI_IMPL_ID=$(jq '.analyzed_files[] | select(.file_path=="cgi-bin/plot_ui.cgi") | .implementation_id' "$ANALYZE_JSON")
-LIB_IMPL_ID=$(jq '.analyzed_files[] | select(.file_path=="lib/Plot/Generator.pm") | .implementation_id' "$ANALYZE_JSON")
-LIB_BEHAVIOR_ID=$(jq '.analyzed_files[] | select(.file_path=="lib/Plot/Generator.pm") | .behavior_id' "$ANALYZE_JSON")
+# ---------------------------------------------------------------------------
+# Extract IDs WITHOUT hardcoding full paths
+# ---------------------------------------------------------------------------
 
-if [ -z "$UI_IMPL_ID" ] || [ -z "$LIB_IMPL_ID" ] || [ -z "$LIB_BEHAVIOR_ID" ]; then
-  echo "ERROR: Could not find expected file entries (cgi-bin/plot_ui.cgi, lib/Plot/Generator.pm)." >&2
+# 1) UI implementation = first file whose path looks CGI-ish
+UI_IMPL_ID=$(
+  jq '
+    .analyzed_files[]
+    | select(
+        (.file_path | contains("cgi-bin/"))
+        or (.file_path | test("cgi"; "i"))
+      )
+    | .implementation_id
+  ' "$ANALYZE_JSON" | head -n 1
+)
+
+# 2) Library implementation = first file under lib/ with a .pm extension
+LIB_IMPL_ID=$(
+  jq '
+    .analyzed_files[]
+    | select(
+        (.file_path | startswith("lib/"))
+        and (.file_path | endswith(".pm"))
+      )
+    | .implementation_id
+  ' "$ANALYZE_JSON" | head -n 1
+)
+
+# 3) Library behavior_id (same filter as above)
+LIB_BEHAVIOR_ID=$(
+  jq '
+    .analyzed_files[]
+    | select(
+        (.file_path | startswith("lib/"))
+        and (.file_path | endswith(".pm"))
+      )
+    | .behavior_id
+  ' "$ANALYZE_JSON" | head -n 1
+)
+
+if [ -z "${UI_IMPL_ID:-}" ] || [ -z "${LIB_IMPL_ID:-}" ] || [ -z "${LIB_BEHAVIOR_ID:-}" ]; then
+  echo "ERROR: Could not identify UI or library implementations from analyzed_files." >&2
+  echo "Check .analyzed_files in $ANALYZE_JSON for unexpected layout." >&2
   exit 1
 fi
 
@@ -53,40 +89,9 @@ echo "LIB_IMPL_ID       = $LIB_IMPL_ID"
 echo "LIB_BEHAVIOR_ID   = $LIB_BEHAVIOR_ID"
 
 # ---------------------------------------------------------------------------
-# 2) Convert the library behavior to Python
+# 2) Build legacy harness for Perl library
 # ---------------------------------------------------------------------------
-echo "=== [2/7] Converting lib/Plot/Generator.pm behavior -> Python via /conversion/convert ==="
-
-TARGET_REPO_NAME="${TARGET_REPO_NAME:-perl-plot-project-python-port}"
-
-CONVERT_PAYLOAD=$(cat <<EOF
-{
-  "behavior_id": $LIB_BEHAVIOR_ID,
-  "source_language": "perl",
-  "target_language": "python",
-  "target_repo_name": "$TARGET_REPO_NAME"
-}
-EOF
-)
-
-CONVERT_JSON="$(mktemp)"
-curl -sS -X POST "$API_BASE/conversion/convert" \
-  -H "Content-Type: application/json" \
-  -d "$CONVERT_PAYLOAD" > "$CONVERT_JSON"
-
-echo "Convert response saved to $CONVERT_JSON"
-cat "$CONVERT_JSON"
-
-PY_IMPL_ID=$(jq '.implementation.id' "$CONVERT_JSON")
-PY_REPO_URL=$(jq -r '.target_repo_url' "$CONVERT_JSON")
-
-echo "PY_IMPL_ID  = $PY_IMPL_ID"
-echo "PY_REPO_URL = $PY_REPO_URL"
-
-# ---------------------------------------------------------------------------
-# 3) Build legacy harness for Perl library
-# ---------------------------------------------------------------------------
-echo "=== [3/7] Building legacy harness via /runtime/build-legacy-harness ==="
+echo "=== [2/8] Building legacy harness via /runtime/build-legacy-harness ==="
 
 HARNESS_PAYLOAD=$(cat <<EOF
 {
@@ -105,13 +110,17 @@ echo "Harness response saved to $HARNESS_JSON"
 cat "$HARNESS_JSON"
 
 HARNESS_IMPL_ID=$(jq '.harness.id' "$HARNESS_JSON")
+if [ -z "${HARNESS_IMPL_ID:-}" ]; then
+  echo "ERROR: No harness.id found in build-legacy-harness response" >&2
+  exit 1
+fi
 
 echo "HARNESS_IMPL_ID = $HARNESS_IMPL_ID"
 
 # ---------------------------------------------------------------------------
-# 4) Run legacy + harness tests (compatibility harness)
+# 3) Run legacy + harness tests (compatibility harness)
 # ---------------------------------------------------------------------------
-echo "=== [4/7] Running legacy + harness tests via /runtime/run-legacy-with-harness ==="
+echo "=== [3/8] Running legacy + harness tests via /runtime/run-legacy-with-harness ==="
 
 RUN_COMPAT_PAYLOAD=$(cat <<EOF
 {
@@ -131,13 +140,99 @@ echo "Compat test response saved to $COMPAT_JSON"
 cat "$COMPAT_JSON"
 
 # ---------------------------------------------------------------------------
-# 5) Build converted tests in the Python repo
+# 4) Full-project conversion Perl -> Python via /conversion/convert-project
 # ---------------------------------------------------------------------------
-echo "=== [5/7] Generating converted tests (pytest) via /runtime/build-converted-tests ==="
+
+echo "=== [4/8] Converting FULL project Perl -> Python via /conversion/convert-project ==="
+
+TARGET_REPO_NAME="${TARGET_REPO_NAME:-perl-plot-project-python-port}"
+
+CONVERT_PROJECT_PAYLOAD=$(cat <<EOF
+{
+  "source_repo_url": "$REPO_URL",
+  "source_revision": "$REVISION",
+  "source_language": "perl",
+  "target_language": "python",
+  "target_repo_name": "$TARGET_REPO_NAME"
+}
+EOF
+)
+
+CONVERT_PROJECT_JSON="$(mktemp)"
+curl -sS -X POST "$API_BASE/conversion/convert-project" \
+  -H "Content-Type: application/json" \
+  -d "$CONVERT_PROJECT_PAYLOAD" > "$CONVERT_PROJECT_JSON"
+
+echo "Full-project conversion response saved to $CONVERT_PROJECT_JSON"
+cat "$CONVERT_PROJECT_JSON"
+
+PY_TARGET_REPO_URL=$(jq -r '.target_repo_url' "$CONVERT_PROJECT_JSON")
+
+# ---------------------------------------------------------------------------
+# Extract Python implementations from .implementations[] in the response
+# ---------------------------------------------------------------------------
+
+# Python LIB impl = file under lib/ ending in .py
+PY_LIB_IMPL_ID=$(
+  jq '
+    .implementations[]
+    | select(
+        (.file_path | startswith("lib/"))
+        and (.file_path | endswith(".py"))
+      )
+    | .id
+  ' "$CONVERT_PROJECT_JSON" | head -n 1
+)
+
+PY_LIB_BEHAVIOR_ID=$(
+  jq '
+    .implementations[]
+    | select(
+        (.file_path | startswith("lib/"))
+        and (.file_path | endswith(".py"))
+      )
+    | .behavior_id
+  ' "$CONVERT_PROJECT_JSON" | head -n 1
+)
+
+# Python UI impl = anything that looks like the converted UI; your current
+# conversion uses app/ui/plot_ui.py, but we match generically.
+PY_UI_IMPL_ID=$(
+  jq '
+    .implementations[]
+    | select(
+        (.file_path | contains("plot_ui.py"))
+        or (.file_path | contains("app/ui/"))
+        or (.file_path | contains("ui/plot"))
+      )
+    | .id
+  ' "$CONVERT_PROJECT_JSON" | head -n 1
+)
+
+echo "PY_TARGET_REPO_URL = $PY_TARGET_REPO_URL"
+echo "PY_LIB_IMPL_ID     = ${PY_LIB_IMPL_ID:-<none>}"
+echo "PY_LIB_BEHAVIOR_ID = ${PY_LIB_BEHAVIOR_ID:-<none>}"
+echo "PY_UI_IMPL_ID      = ${PY_UI_IMPL_ID:-<none>}"
+
+if [ -z "${PY_LIB_IMPL_ID:-}" ] || [ -z "${PY_LIB_BEHAVIOR_ID:-}" ]; then
+  echo "ERROR: Could not identify Python library implementation from /conversion/convert-project." >&2
+  exit 1
+fi
+
+# Python UI is optional; we only treat it as an error if you really want UI.
+if [ -z "${PY_UI_IMPL_ID:-}" ]; then
+  echo "WARNING: No Python UI implementation found in conversion mapping; Python UI deployment will be skipped." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 5) Build converted tests in the Python repo (library)
+# ---------------------------------------------------------------------------
+
+echo "=== [5/8] Generating converted tests (pytest) via /runtime/build-converted-tests ==="
 
 BUILD_CONVERTED_TESTS_PAYLOAD=$(cat <<EOF
 {
-  "implementation_id": $PY_IMPL_ID
+  "implementation_id": $PY_LIB_IMPL_ID
 }
 EOF
 )
@@ -151,50 +246,90 @@ echo "Converted tests response saved to $CONVERTED_TESTS_JSON"
 cat "$CONVERTED_TESTS_JSON"
 
 # ---------------------------------------------------------------------------
-# 6) Run tests for Python implementation (inside Podman)
+# 6) Run tests for Python library implementation (inside Podman)
 # ---------------------------------------------------------------------------
-echo "=== [6/7] Running tests for converted Python implementation via /runtime/test-implementation ==="
 
-TEST_PY_PAYLOAD=$(cat <<EOF
+echo "=== [6/8] Running tests for converted Python library via /runtime/test-implementation ==="
+
+TEST_PY_LIB_PAYLOAD=$(cat <<EOF
 {
-  "implementation_id": $PY_IMPL_ID
+  "implementation_id": $PY_LIB_IMPL_ID
 }
 EOF
 )
 
-TEST_PY_JSON="$(mktemp)"
+TEST_PY_LIB_JSON="$(mktemp)"
 curl -sS -X POST "$API_BASE/runtime/test-implementation" \
   -H "Content-Type: application/json" \
-  -d "$TEST_PY_PAYLOAD" > "$TEST_PY_JSON"
+  -d "$TEST_PY_LIB_PAYLOAD" > "$TEST_PY_LIB_JSON"
 
-echo "Python test run response saved to $TEST_PY_JSON"
-cat "$TEST_PY_JSON"
+echo "Python library test run response saved to $TEST_PY_LIB_JSON"
+cat "$TEST_PY_LIB_JSON"
 
 # ---------------------------------------------------------------------------
 # 7) Deploy legacy Perl UI as a service
 # ---------------------------------------------------------------------------
-echo "=== [7/7] Deploying legacy Perl UI via /runtime/deploy-service ==="
 
-DEPLOY_PAYLOAD=$(cat <<EOF
+echo "=== [7/8] Deploying legacy Perl UI via /runtime/deploy-service ==="
+
+DEPLOY_PERL_PAYLOAD=$(cat <<EOF
 {
   "implementation_id": $UI_IMPL_ID
 }
 EOF
 )
 
-DEPLOY_JSON="$(mktemp)"
+DEPLOY_PERL_JSON="$(mktemp)"
 curl -sS -X POST "$API_BASE/runtime/deploy-service" \
   -H "Content-Type: application/json" \
-  -d "$DEPLOY_PAYLOAD" > "$DEPLOY_JSON"
+  -d "$DEPLOY_PERL_PAYLOAD" > "$DEPLOY_PERL_JSON"
 
-echo "Deploy response saved to $DEPLOY_JSON"
-cat "$DEPLOY_JSON"
+echo "Perl UI deploy response saved to $DEPLOY_PERL_JSON"
+cat "$DEPLOY_PERL_JSON"
 
-SERVICE_URL=$(jq -r '.url' "$DEPLOY_JSON")
+PERL_SERVICE_URL=$(jq -r '.url // empty' "$DEPLOY_PERL_JSON")
+
+# ---------------------------------------------------------------------------
+# 8) Deploy converted Python UI as a service (if we found one)
+# ---------------------------------------------------------------------------
+
+PY_SERVICE_URL=""
+if [ -n "${PY_UI_IMPL_ID:-}" ]; then
+  echo "=== [8/8] Deploying Python UI via /runtime/deploy-service ==="
+
+  DEPLOY_PY_PAYLOAD=$(cat <<EOF
+{
+  "implementation_id": $PY_UI_IMPL_ID
+}
+EOF
+)
+
+  DEPLOY_PY_JSON="$(mktemp)"
+  curl -sS -X POST "$API_BASE/runtime/deploy-service" \
+    -H "Content-Type: application/json" \
+    -d "$DEPLOY_PY_PAYLOAD" > "$DEPLOY_PY_JSON"
+
+  echo "Python UI deploy response saved to $DEPLOY_PY_JSON"
+  cat "$DEPLOY_PY_JSON"
+
+  PY_SERVICE_URL=$(jq -r '.url // empty' "$DEPLOY_PY_JSON")
+else
+  echo "Skipping Python UI deployment because no PY_UI_IMPL_ID was discovered."
+fi
 
 echo
 echo "==============================================="
 echo "Pipeline complete"
 echo "Legacy Perl UI should be reachable at:"
-echo "  $SERVICE_URL"
+echo "  ${PERL_SERVICE_URL:-<unknown>}"
+echo
+echo "Converted Python library repo:"
+echo "  ${PY_TARGET_REPO_URL:-<unknown>}"
+echo
+if [ -n "${PY_SERVICE_URL:-}" ]; then
+  echo "Converted Python UI should be reachable at:"
+  echo "  $PY_SERVICE_URL"
+else
+  echo "Converted Python UI was not deployed (PY_UI_IMPL_ID empty)."
+fi
 echo "==============================================="

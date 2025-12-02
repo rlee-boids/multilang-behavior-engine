@@ -67,16 +67,15 @@ def _build_conversion_prompt(
     contract: Optional[BehaviorContract],
     source_language: str,
     target_language: str,
-    *,
-    file_path: Optional[str] = None,
+    file_path: str,
 ) -> str:
     """
     Build a prompt instructing the model to do a direct-ish translation
     from the source language to the target language.
 
-    Now slightly UI-aware:
-    - If this looks like a CGI / UI entrypoint and target is Python,
-      we give extra guidance to produce idiomatic Python web code.
+    We also give the model a bit of repository / file-path context so that,
+    for example, Perl CGI entrypoints can be mapped to a more idiomatic
+    Python layout while still preserving observable behaviour.
     """
     contract_snippet = ""
     if contract:
@@ -91,72 +90,57 @@ def _build_conversion_prompt(
             Test cases (JSON):
             {contract.test_cases}
             """
-        ).strip()
+        )
 
     behavior_desc = behavior.description or behavior.name
 
-    # --- UI-aware hinting ----------------------------------------------------
-    ui_hint = ""
-    is_ui_like = False
+    file_context = f"This source file's path in its Git repo is: {file_path!r}.\n"
 
-    if file_path:
-        lower_path = file_path.lower()
-        # Heuristics for "this is probably a UI/CGI entrypoint"
-        if (
-            "cgi-bin" in lower_path
-            or lower_path.endswith(".cgi")
-            or "plot_ui" in lower_path
-        ):
-            is_ui_like = True
-
-    # If Behavior has a domain field like "ui", "web", "cgi", we can also use it.
-    behavior_domain = getattr(behavior, "domain", None)
-    if behavior_domain and isinstance(behavior_domain, str):
-        if behavior_domain.lower() in {"ui", "web", "cgi", "frontend"}:
-            is_ui_like = True
-
-    if target_language.lower() == "python" and is_ui_like:
-        ui_hint = dedent(
+    # A little bit of special guidance for Perl -> Python so the AI doesn't feel
+    # forced into a literal cgi-bin style layout.
+    extra_guidance = ""
+    if source_language.lower() == "perl" and target_language.lower() == "python":
+        extra_guidance = dedent(
             """
-            Additional requirements for Python UI / web conversion:
+            Additional guidance for Perl -> Python:
 
-            - The source is a CGI-style or UI entrypoint. Convert it into idiomatic Python web code
-              instead of doing a literal CGI translation.
-            - Prefer a lightweight web style (for example, FastAPI or a simple WSGI/ASGI app)
-              over raw CGI.
-            - Separate concerns:
-                * Keep core business / plotting logic in reusable functions or modules.
-                * The web layer should:
-                    - parse incoming HTTP parameters or JSON
-                    - call the reusable logic
-                    - return an HTTP response (HTML, JSON, or binary image) with correct headers.
-            - Expose a clear application entrypoint that a server can use:
-                * For ASGI: provide `app = FastAPI()` (or similar) as the main application object.
-                * For WSGI: provide `application = ...`.
-            - Preserve the incoming parameters and behavior of the original CGI endpoint
-              (names and semantics), but DO NOT be constrained to CGI environment variables.
-            - Assume the converted file will live in a Python project and be run inside a container.
+            - If this file is a library under `lib/`, convert it into a normal
+              importable Python module, keeping function and class names where reasonable.
+            - If this file is an executable script under `bin/`, convert it into a
+              Python CLI script with a clear `main()` entrypoint.
+            - If this file lives under `cgi-bin/` or otherwise serves a web UI
+              (for example `cgi-bin/plot_ui.cgi`), convert it into a small,
+              idiomatic Python web entrypoint that can be run inside a container.
+              A simple approach is:
+                * keep a clear `main()` or `handler()` function that exercises the
+                  same end-to-end behaviour as the original CGI script
+                * collect helper logic into functions or classes instead of relying
+                  on global script code
+              Do NOT introduce heavy frameworks unless the existing code clearly
+              implies one; keep it lightweight and close to the original behaviour.
             """
         ).strip()
 
-    # --- Base prompt ---------------------------------------------------------
     prompt = f"""
     You are a senior software engineer who is an expert in both {source_language} and {target_language}.
 
     Your task is to convert the following {source_language} code into an idiomatic {target_language} module
-    that preserves the behavior as closely as possible.
+    that preserves the behaviour as closely as possible.
 
     Behavior description:
     {behavior_desc}
 
+    {file_context}
+    {extra_guidance}
+
     {contract_snippet}
 
-    {ui_hint}
-
     Requirements:
-    - Maintain the same high-level functionality and behavior.
+    - Maintain the same high-level functionality and external behaviour.
     - Preserve function names and signatures where it makes sense.
     - If the original defines a module/class/namespace, reflect that appropriately in {target_language}.
+    - If the original is an executable or CGI-style script, make sure the converted file
+      still has a single obvious entrypoint that drives the same flow.
     - Do NOT include placeholders like "TODO" or "NotImplementedError".
     - Do NOT include any explanation or commentary outside of comments in the code.
     - Return ONLY the final {target_language} code, no markdown, no prose, no triple backticks.
@@ -232,7 +216,7 @@ def generate_target_code_from_ai(
     High-level helper:
 
     - Fetch source code from GitHub
-    - Build a conversion prompt (UI-aware when appropriate)
+    - Build a conversion prompt (with file-path context)
     - Call selected AI provider
     - Return generated target-language code
     """
@@ -248,7 +232,7 @@ def generate_target_code_from_ai(
         contract=contract,
         source_language=source_language,
         target_language=target_language,
-        file_path=file_path,  # <-- lets the prompt detect CGI / UI entrypoints
+        file_path=file_path,
     )
 
     if settings.AI_PROVIDER == "google":
