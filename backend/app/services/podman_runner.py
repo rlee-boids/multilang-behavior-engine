@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.behavior_implementation import BehaviorImplementation
 from app.adapters import get_adapter
-
+DEBUG_PODMAN = os.getenv("MLBE_DEBUG_PODMAN", "0") == "1"
 
 class PodmanRuntimeError(RuntimeError):
     """
@@ -68,18 +68,17 @@ class PodmanResult:
 # Default is "podman", per your current design.
 PODMAN_BIN = os.getenv("MLBE_CONTAINER_BIN", "podman")
 
-
+GIT_BIN = os.getenv("MLBE_GIT_BIN", "git")
 # ---------- Low-level podman wrapper ----------
 
 
 async def run_podman(args: List[str], cwd: Optional[Path] = None) -> PodmanExecResult:
     """
     Run the configured container runtime (PODMAN_BIN) with the given args.
-
-    - Uses PODMAN_BIN (e.g. "podman", "/opt/podman/bin/podman", or "docker")
-    - Captures stdout/stderr.
-    - Raises PodmanRuntimeError on non-zero exit or if the binary is missing.
     """
+    if DEBUG_PODMAN:
+        print(f"[MLBE_DEBUG] run_podman: PODMAN_BIN={PODMAN_BIN!r}, args={args}, cwd={cwd}")
+
     try:
         proc = await asyncio.create_subprocess_exec(
             PODMAN_BIN,
@@ -89,8 +88,7 @@ async def run_podman(args: List[str], cwd: Optional[Path] = None) -> PodmanExecR
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError as exc:
-        # This is the [Errno 2] case you were seeing before. We convert it to a
-        # clear PodmanRuntimeError so the API response is more informative.
+        # If we hit this, you’ll see a PodmanRuntimeError, not raw [Errno 2]
         raise PodmanRuntimeError(
             (
                 f"Container runtime '{PODMAN_BIN}' not found. "
@@ -114,27 +112,72 @@ async def run_podman(args: List[str], cwd: Optional[Path] = None) -> PodmanExecR
 
     return PodmanExecResult(stdout=stdout, stderr=stderr, exit_code=proc.returncode)
 
-
 # ---------- Local git helpers (self-contained) ----------
 
 
 async def _run_git(args: list[str], cwd: Path) -> None:
     """
-    Run a git command and raise PodmanRuntimeError on failure.
+    Run a git command (GIT_BIN) and raise PodmanRuntimeError on failure.
+
+    This version explicitly checks both:
+      - that GIT_BIN exists and is executable
+      - that cwd exists
+    so we don't mis-diagnose FileNotFoundError.
     """
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        *args,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    if DEBUG_PODMAN:
+        print(f"[MLBE_DEBUG] _run_git: GIT_BIN={GIT_BIN!r}, args={args}, cwd={cwd}")
+
+    # Pre-check binary and cwd before spawning
+    import os as _os
+
+    git_exists = _os.path.exists(GIT_BIN)
+    git_x_ok = _os.access(GIT_BIN, _os.X_OK)
+    cwd_exists = cwd.exists()
+
+    if DEBUG_PODMAN:
+        print(
+            f"[MLBE_DEBUG] _run_git precheck: "
+            f"git_exists={git_exists}, git_x_ok={git_x_ok}, cwd_exists={cwd_exists}"
+        )
+
+    if not cwd_exists:
+        raise PodmanRuntimeError(
+            f"Git cwd '{cwd}' does not exist. "
+            f"(GIT_BIN='{GIT_BIN}')"
+        )
+
+    if not git_exists or not git_x_ok:
+        raise PodmanRuntimeError(
+            f"Git binary '{GIT_BIN}' is not usable: "
+            f"exists={git_exists}, executable={git_x_ok}. "
+            "Install git and ensure it is executable for the backend process, "
+            "or set MLBE_GIT_BIN to a valid git binary (e.g. /opt/homebrew/bin/git)."
+        )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            GIT_BIN,
+            *args,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        # If we get here, the OS raised ENOENT anyway (rare if prechecks passed);
+        # just dump all context.
+        raise PodmanRuntimeError(
+            "Git invocation failed with FileNotFoundError. "
+            f"GIT_BIN='{GIT_BIN}', cwd='{cwd}'. "
+            "Double-check that both the git binary and cwd exist and are accessible."
+        ) from exc
+
     stdout_b, stderr_b = await proc.communicate()
     stdout = stdout_b.decode()
     stderr = stderr_b.decode()
+
     if proc.returncode != 0:
         raise PodmanRuntimeError(
-            f"git {' '.join(args)} failed with exit {proc.returncode}",
+            f"{GIT_BIN} {' '.join(args)} failed with exit {proc.returncode}",
             stdout=stdout,
             stderr=stderr,
             exit_code=proc.returncode,
@@ -181,6 +224,7 @@ async def clone_or_update_repo(
     - Else:
         git clone <repo_url> <dir>; git checkout <revision>
     """
+    base_dir = base_dir.resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
 
     # Normalize to .git URL
@@ -260,7 +304,7 @@ async def run_tests_for_implementation(
     adapter = get_adapter(impl.language)
 
     # Workspace where we clone the repo
-    workspace_root = Path(getattr(settings, "analyzer_workspace_root", "./workspace"))
+    workspace_root = Path(os.path.abspath(settings.ANALYZER_WORKSPACE_ROOT))
     workspace_root.mkdir(parents=True, exist_ok=True)
 
     repo_root = await clone_or_update_repo(
@@ -362,7 +406,7 @@ async def run_legacy_with_harness(
     language = legacy_impl.language
     adapter = get_adapter(language)
 
-    workspace_root = Path(getattr(settings, "analyzer_workspace_root", "./workspace"))
+    workspace_root = Path(os.path.abspath(settings.ANALYZER_WORKSPACE_ROOT))
     workspace_root.mkdir(parents=True, exist_ok=True)
 
     legacy_root = await clone_or_update_repo(

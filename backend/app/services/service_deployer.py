@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import os
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +16,7 @@ from app.services.podman_runner import (
     PodmanRuntimeError,
 )
 
+SERVICES_WORKSPACE_ROOT = Path(os.path.abspath(getattr(settings, "SERVICES_WORKSPACE_ROOT", "services_workspace")))
 
 class ServiceDeploymentError(Exception):
     """Raised when deploying a behavior UI service fails."""
@@ -44,9 +45,11 @@ def _get_service_workspace_root() -> Path:
     root = getattr(settings, "service_workspace_root", None)
     if not root:
         root = "./services_workspace"
-    p = Path(root)
+    # Make this absolute so it doesn’t depend on uvicorn’s CWD
+    p = Path(root).resolve()
     p.mkdir(parents=True, exist_ok=True)
     return p
+
 
 
 def _render_perl_psgi_app(cgi_path: str) -> str:
@@ -74,6 +77,10 @@ def _render_perl_psgi_app(cgi_path: str) -> str:
 def _render_perl_ui_dockerfile() -> str:
     """
     Dockerfile for running a Perl CGI/PSGI UI via plackup.
+
+    We tweak APT sources to use HTTPS when possible, to avoid transparent
+    HTTP proxies / captive portals (e.g. Meraki) that block plain HTTP
+    access to deb.debian.org.
     """
     return textwrap.dedent(
         """\
@@ -84,23 +91,33 @@ def _render_perl_ui_dockerfile() -> str:
         # Copy entire repo as build context
         COPY . /app
 
-        # Install system libs + CPAN modules needed by Plot::Generator + PSGI
-        RUN apt-get update \
-            && apt-get install -y --no-install-recommends \
-                cpanminus \
-                libgd-dev \
-            && cpanm --notest \
-                GD::Graph \
-                JSON \
-                File::Slurp \
-                Plack \
-                CGI::Emulate::PSGI \
-                CGI::Compile \
-            && apt-get clean \
+        # Install required deps via apt + cpanm.
+        # On newer Debian images, /etc/apt/sources.list may not exist and
+        # APT uses /etc/apt/sources.list.d/debian.sources instead. We
+        # conditionally rewrite both, if present, to prefer HTTPS URIs.
+        RUN if [ -f /etc/apt/sources.list ]; then \\
+                sed -i 's#http://deb.debian.org#https://deb.debian.org#g' /etc/apt/sources.list; \\
+            fi \\
+            && if [ -f /etc/apt/sources.list.d/debian.sources ]; then \\
+                sed -i 's#http://deb.debian.org/debian#https://deb.debian.org/debian#g' /etc/apt/sources.list.d/debian.sources; \\
+            fi \\
+            && apt-get update \\
+            && apt-get install -y --no-install-recommends \\
+                cpanminus \\
+                libgd-dev \\
+            && cpanm --notest \\
+                GD::Graph \\
+                JSON \\
+                File::Slurp \\
+                Plack \\
+                CGI::Emulate::PSGI \\
+                CGI::Compile \\
+            && apt-get clean \\
             && rm -rf /var/lib/apt/lists/*
 
         EXPOSE 5000
 
+        # Run via plackup, adding lib/ to include path
         CMD ["plackup", "-Ilib", "-p", "5000", "app.psgi"]
         """
     )

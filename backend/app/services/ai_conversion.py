@@ -67,10 +67,16 @@ def _build_conversion_prompt(
     contract: Optional[BehaviorContract],
     source_language: str,
     target_language: str,
+    *,
+    file_path: Optional[str] = None,
 ) -> str:
     """
     Build a prompt instructing the model to do a direct-ish translation
     from the source language to the target language.
+
+    Now slightly UI-aware:
+    - If this looks like a CGI / UI entrypoint and target is Python,
+      we give extra guidance to produce idiomatic Python web code.
     """
     contract_snippet = ""
     if contract:
@@ -85,10 +91,55 @@ def _build_conversion_prompt(
             Test cases (JSON):
             {contract.test_cases}
             """
-        )
+        ).strip()
 
     behavior_desc = behavior.description or behavior.name
 
+    # --- UI-aware hinting ----------------------------------------------------
+    ui_hint = ""
+    is_ui_like = False
+
+    if file_path:
+        lower_path = file_path.lower()
+        # Heuristics for "this is probably a UI/CGI entrypoint"
+        if (
+            "cgi-bin" in lower_path
+            or lower_path.endswith(".cgi")
+            or "plot_ui" in lower_path
+        ):
+            is_ui_like = True
+
+    # If Behavior has a domain field like "ui", "web", "cgi", we can also use it.
+    behavior_domain = getattr(behavior, "domain", None)
+    if behavior_domain and isinstance(behavior_domain, str):
+        if behavior_domain.lower() in {"ui", "web", "cgi", "frontend"}:
+            is_ui_like = True
+
+    if target_language.lower() == "python" and is_ui_like:
+        ui_hint = dedent(
+            """
+            Additional requirements for Python UI / web conversion:
+
+            - The source is a CGI-style or UI entrypoint. Convert it into idiomatic Python web code
+              instead of doing a literal CGI translation.
+            - Prefer a lightweight web style (for example, FastAPI or a simple WSGI/ASGI app)
+              over raw CGI.
+            - Separate concerns:
+                * Keep core business / plotting logic in reusable functions or modules.
+                * The web layer should:
+                    - parse incoming HTTP parameters or JSON
+                    - call the reusable logic
+                    - return an HTTP response (HTML, JSON, or binary image) with correct headers.
+            - Expose a clear application entrypoint that a server can use:
+                * For ASGI: provide `app = FastAPI()` (or similar) as the main application object.
+                * For WSGI: provide `application = ...`.
+            - Preserve the incoming parameters and behavior of the original CGI endpoint
+              (names and semantics), but DO NOT be constrained to CGI environment variables.
+            - Assume the converted file will live in a Python project and be run inside a container.
+            """
+        ).strip()
+
+    # --- Base prompt ---------------------------------------------------------
     prompt = f"""
     You are a senior software engineer who is an expert in both {source_language} and {target_language}.
 
@@ -99,6 +150,8 @@ def _build_conversion_prompt(
     {behavior_desc}
 
     {contract_snippet}
+
+    {ui_hint}
 
     Requirements:
     - Maintain the same high-level functionality and behavior.
@@ -179,7 +232,7 @@ def generate_target_code_from_ai(
     High-level helper:
 
     - Fetch source code from GitHub
-    - Build a conversion prompt
+    - Build a conversion prompt (UI-aware when appropriate)
     - Call selected AI provider
     - Return generated target-language code
     """
@@ -195,6 +248,7 @@ def generate_target_code_from_ai(
         contract=contract,
         source_language=source_language,
         target_language=target_language,
+        file_path=file_path,  # <-- lets the prompt detect CGI / UI entrypoints
     )
 
     if settings.AI_PROVIDER == "google":

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-
+import traceback
+import sys
 from app.api.deps import get_db
 from app.schemas.implementation import BehaviorImplementationRead
 from app.schemas.runtime import (
@@ -52,11 +53,26 @@ async def test_implementation(
     Uses the language adapter's container image + build_command + test_command.
     """
     try:
-        result = await run_tests_for_implementation(db=db, implementation_id=req.implementation_id)
+        result = await run_tests_for_implementation(
+            db=db,
+            implementation_id=req.implementation_id,
+        )
     except PodmanRuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(
+            status_code=500,
+            detail=f"[MLBE_DEBUG PodmanRuntimeError] {exc}",
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Runtime test failed: {exc}")
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"[MLBE_DEBUG GenericError] "
+                f"type={type(exc).__name__}, repr={exc!r}\n"
+                f"traceback:\n{tb}"
+            ),
+        )
+
 
     return TestImplementationResponse(
         implementation_id=req.implementation_id,

@@ -194,7 +194,7 @@ SERVICE_URL=$(jq -r '.url' "$DEPLOY_JSON")
 
 echo
 echo "==============================================="
-echo "Pipeline complete ✅"
+echo "Pipeline complete"
 echo "Legacy Perl UI should be reachable at:"
 echo "  $SERVICE_URL"
 echo "==============================================="
