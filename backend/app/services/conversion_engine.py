@@ -12,7 +12,10 @@ from app.models.behavior import Behavior
 from app.models.behavior_contract import BehaviorContract
 from app.models.behavior_implementation import BehaviorImplementation
 from app.services.github_client import get_github_client, GitHubError
-from app.services.ai_conversion import generate_target_code_from_ai, AIConversionError
+from app.services.ai_conversion import (
+    generate_target_artifacts_from_ai,
+    AIConversionError,
+)
 
 
 class ConversionError(Exception):
@@ -141,6 +144,28 @@ def _map_file_path_for_target_language(
     return str(p.with_suffix(new_suffix))
 
 
+def _infer_python_requirements_from_code(code: str) -> List[str]:
+    """
+    Very lightweight heuristic to infer some third-party deps from the code
+    itself, as a safety net when the AI doesn't populate python_requirements.
+    """
+    inferred: List[str] = []
+
+    def add(pkg: str) -> None:
+        if pkg and pkg not in inferred:
+            inferred.append(pkg)
+
+    # Matplotlib (your immediate pain point)
+    if "import matplotlib" in code or "from matplotlib" in code:
+        add("matplotlib")
+
+    # Example for future extension:
+    # if "import requests" in code or "from requests" in code:
+    #     add("requests")
+
+    return inferred
+
+
 async def convert_full_project(
     db: Session,
     *,
@@ -235,14 +260,17 @@ async def convert_full_project(
         # Fall back: use the repo URL from the first conversion
         target_repo_url = conversions[0]["target_repo_url"]
 
+    # NOTE: some of your pipeline scripts expect "implementations", others
+    # might expect "conversions"; keep whichever your current API uses.
     return {
         "target_repo_url": target_repo_url,
         "source_repo_url": source_repo_url,
         "source_revision": source_revision,
         "source_language": source_language,
         "target_language": target_language,
-        "conversions": conversions,
+        "implementations": conversions,
     }
+
 
 async def convert_behavior_stub(
     db: Session,
@@ -269,7 +297,7 @@ async def convert_behavior_stub(
 
     To convert an entire legacy project (e.g. the whole Perl repo) you can
     call this once per behaviour / source implementation, *reusing* the same
-    target_repo_name so all converted files land in the same Python repo.
+    target_repo_name so all converted files land in a single Python repo.
     """
     if source_language == target_language:
         raise ConversionError("Source and target language must be different")
@@ -319,9 +347,10 @@ async def convert_behavior_stub(
     placeholder_code += "\n\n"
     placeholder_code += "# TODO: Replace this placeholder with AI-generated implementation.\n"
 
-    # ---- AI conversion ----
+    # ---- AI conversion (now returns code + python_requirements) ----
+    python_requirements: List[str] = []
     try:
-        generated_code = generate_target_code_from_ai(
+        artifacts = generate_target_artifacts_from_ai(
             repo_url=source_impl.repo_url,
             revision=source_impl.revision,
             file_path=source_impl.file_path,
@@ -330,7 +359,17 @@ async def convert_behavior_stub(
             source_language=source_language,
             target_language=target_language,
         )
-        code_to_write = generated_code
+        code_to_write = artifacts.code
+
+        # Start with whatever the AI gave us
+        python_requirements = artifacts.python_requirements or []
+
+        # Safety net: infer deps directly from the generated code
+        inferred = _infer_python_requirements_from_code(code_to_write)
+        for req in inferred:
+            if req not in python_requirements:
+                python_requirements.append(req)
+
         ai_note = "AI conversion succeeded"
         ai_error_message: Optional[str] = None
     except AIConversionError as exc:
@@ -338,6 +377,9 @@ async def convert_behavior_stub(
         ai_note = "AI conversion FAILED, placeholder stub written instead"
         ai_error_message = str(exc)
         code_to_write = placeholder_code + f"\n# AI conversion error: {exc}\n"
+
+        # Even placeholder may contain imports; we can still try to infer deps.
+        python_requirements = _infer_python_requirements_from_code(code_to_write)
 
     # Write main target file
     try:
@@ -356,12 +398,25 @@ async def convert_behavior_stub(
     # This gives the runtime a stable way to install deps via the PythonAdapter.build_command.
     notes_requirements: Optional[str] = None
     if target_language.lower() == "python":
+        # Base requirements we always want present
+        all_reqs: List[str] = []
+
+        def add_req(pkg: str) -> None:
+            if pkg and pkg not in all_reqs:
+                all_reqs.append(pkg)
+
+        # Always include pytest so the runtime can run tests
+        add_req("pytest")
+
+        # Include AI-provided + inferred requirements
+        for r in python_requirements:
+            add_req(r)
+
         requirements_lines = [
             "# Auto-generated by MultiLang Behavior Engine",
             "# You can edit this file as needed.",
             "",
-            # We always include pytest so the runtime can run tests for the converted implementation.
-            "pytest",
+            *all_reqs,
         ]
         requirements_content = "\n".join(requirements_lines) + "\n"
 
@@ -371,10 +426,16 @@ async def convert_behavior_stub(
                 path="requirements.txt",
                 content=requirements_content,
                 commit_message=(
-                    f"Add auto-generated requirements.txt for behavior {behavior.id}"
+                    f"Add/Update auto-generated requirements.txt for behavior {behavior.id}"
                 ),
             )
-            notes_requirements = "requirements.txt auto-generated with `pytest`."
+            if python_requirements:
+                notes_requirements = (
+                    "requirements.txt auto-generated with pytest + "
+                    f"AI/inferred deps: {', '.join(sorted(set(python_requirements)))}."
+                )
+            else:
+                notes_requirements = "requirements.txt auto-generated with default `pytest` only."
         except GitHubError as exc:
             # Don't fail conversion if this write fails; just record a warning in notes.
             notes_requirements = f"WARNING: failed to write requirements.txt: {exc}"

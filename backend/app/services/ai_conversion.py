@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from textwrap import dedent
-from typing import Optional
+from typing import Optional, List
 
+import re
+import json
 import httpx
 from google import genai
 from openai import OpenAI
@@ -14,6 +17,133 @@ from app.models.behavior_contract import BehaviorContract
 
 class AIConversionError(Exception):
     pass
+
+
+@dataclass
+class TargetArtifacts:
+    """
+    Bundle of AI conversion outputs:
+
+    - code: final target-language source.
+    - python_requirements: list of pip requirement strings needed by that code.
+    """
+    code: str
+    python_requirements: List[str]
+
+def _clean_ai_code_string(text: str) -> str:
+    """
+    Final-pass sanitizer for AI-generated code.
+
+    Designed to work on the *code string* that was already extracted
+    from Gemini's pseudo-JSON by _best_effort_extract_code_from_pseudo_json.
+
+    We:
+    - Strip outer markdown fences if Gemini added ```...```.
+    - Fix escaped quotes (\" -> ", \\\" -> " etc.).
+    - Remove trailing backslashes at end-of-line (which caused \"\"\"\\ and
+      similar issues in docstrings).
+
+    IMPORTANT: we do NOT touch '\\n' / '\\t' escape sequences, because they
+    are often inside Python string literals. Replacing them with actual
+    newlines is exactly what broke code like:
+
+        print("Server stopped.\\n")
+
+    into:
+
+        print("
+        Server stopped.")
+    """
+    if not text:
+        return text
+
+    cleaned = text.strip()
+    cleaned = _strip_markdown_fences(cleaned).strip()
+
+    # Case 1: if someone upstream wrapped the whole thing in single or
+    # double quotes, try to unescape once as a string literal.
+    if (
+        len(cleaned) >= 2
+        and cleaned[0] == cleaned[-1]
+        and cleaned[0] in ("'", '"')
+    ):
+        inner = cleaned[1:-1]
+        try:
+            # Interpret common escapes once (\" -> ", \\n -> \n, etc.)
+            # NOTE: this path is mainly for truly "string-literal wrapped"
+            # code, which is rarer with your best-effort extractor.
+            cleaned = bytes(inner, "utf-8").decode("unicode_escape")
+        except Exception:
+            cleaned = inner
+    else:
+        # General case: the string already looks like source code.
+        # Only fix problematic escaped quotes; DO NOT touch \n / \t.
+        cleaned = cleaned.replace('\\"', '"').replace("\\'", "'")
+        # Sometimes we get double-escaped quotes.
+        cleaned = cleaned.replace("\\\\\"", '"').replace("\\\\'", "'")
+
+    # Drop trailing backslashes that show up at EOL (e.g. in
+    # docstrings like \"\"\"...\"\"\"\\)
+    lines = cleaned.splitlines()
+    trimmed_lines = []
+    for line in lines:
+        if line.endswith("\\"):
+            trimmed_lines.append(line[:-1])
+        else:
+            trimmed_lines.append(line)
+    cleaned = "\n".join(trimmed_lines)
+
+    return cleaned
+
+
+def _best_effort_extract_code_from_pseudo_json(text: str) -> str:
+    """
+    If the raw Gemini response *looks* like JSON with a "code" field
+    but isn't valid JSON, try to pull out that string and decode escapes.
+
+    If that fails, return the original text.
+    """
+    # Look for "code": "...."
+    m = re.search(r'"code"\s*:\s*"(?P<code>(?:[^"\\]|\\.)*)"', text, re.DOTALL)
+    if not m:
+        return text
+
+    raw_code = m.group("code")
+
+    # Safest way to decode JSON-style escapes is to wrap in quotes and json.loads
+    try:
+        return json.loads(f'"{raw_code}"')
+    except json.JSONDecodeError:
+        # Fallback: manual common escape replacements
+        return (
+            raw_code
+            .replace("\\n", "\n")
+            .replace("\\r", "\r")
+            .replace("\\t", "\t")
+        )
+
+
+def _best_effort_extract_requirements_from_pseudo_json(text: str) -> List[str]:
+    """
+    Try to salvage "python_requirements": [ ... ] from a not-quite-valid JSON blob.
+    """
+    m = re.search(
+        r'"python_requirements"\s*:\s*\[(?P<body>.*?)\]',
+        text,
+        re.DOTALL,
+    )
+    if not m:
+        return []
+
+    body = "[" + m.group("body") + "]"
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    except json.JSONDecodeError:
+        pass
+
+    return []
 
 
 def _fetch_source_code_from_github(
@@ -71,11 +201,13 @@ def _build_conversion_prompt(
 ) -> str:
     """
     Build a prompt instructing the model to do a direct-ish translation
-    from the source language to the target language.
+    from the source language to the target language, and RETURN JSON
+    ARTIFACTS:
 
-    We also give the model a bit of repository / file-path context so that,
-    for example, Perl CGI entrypoints can be mapped to a more idiomatic
-    Python layout while still preserving observable behaviour.
+      {
+        "code": "<full target-language source>",
+        "python_requirements": ["matplotlib", ...]
+      }
     """
     contract_snippet = ""
     if contract:
@@ -96,8 +228,8 @@ def _build_conversion_prompt(
 
     file_context = f"This source file's path in its Git repo is: {file_path!r}.\n"
 
-    # A little bit of special guidance for Perl -> Python so the AI doesn't feel
-    # forced into a literal cgi-bin style layout.
+    # Extra guidance for Perl -> Python so the AI doesn't feel
+    # forced into a literal cgi-bin layout.
     extra_guidance = ""
     if source_language.lower() == "perl" and target_language.lower() == "python":
         extra_guidance = dedent(
@@ -106,18 +238,29 @@ def _build_conversion_prompt(
 
             - If this file is a library under `lib/`, convert it into a normal
               importable Python module, keeping function and class names where reasonable.
+
             - If this file is an executable script under `bin/`, convert it into a
               Python CLI script with a clear `main()` entrypoint.
+
             - If this file lives under `cgi-bin/` or otherwise serves a web UI
               (for example `cgi-bin/plot_ui.cgi`), convert it into a small,
-              idiomatic Python web entrypoint that can be run inside a container.
-              A simple approach is:
-                * keep a clear `main()` or `handler()` function that exercises the
-                  same end-to-end behaviour as the original CGI script
-                * collect helper logic into functions or classes instead of relying
-                  on global script code
-              Do NOT introduce heavy frameworks unless the existing code clearly
-              implies one; keep it lightweight and close to the original behaviour.
+              idiomatic Python *WSGI* entrypoint that can be run inside a container.
+
+              Concretely, for CGI-style code:
+                * Expose a WSGI callable named `application(environ, start_response)`.
+                * Handle both GET query parameters and POSTed form data, similar to CGI.
+                * Render HTML directly as a bytes iterable from `application`.
+                * Do NOT depend on heavyweight frameworks (no Flask/Django/etc); use
+                  only the standard library plus whatever minimal third-party libs
+                  you list in `python_requirements` (e.g., matplotlib).
+
+              For local/container demo:
+                * Add a standard `if __name__ == "__main__":` block that uses
+                  `wsgiref.simple_server.make_server("0.0.0.0", 8000, application)`
+                  and calls `serve_forever()`.
+
+            - Keep the overall behaviour close to the original CGI script, but with
+              clean, testable Python functions and classes where appropriate.
             """
         ).strip()
 
@@ -143,7 +286,23 @@ def _build_conversion_prompt(
       still has a single obvious entrypoint that drives the same flow.
     - Do NOT include placeholders like "TODO" or "NotImplementedError".
     - Do NOT include any explanation or commentary outside of comments in the code.
-    - Return ONLY the final {target_language} code, no markdown, no prose, no triple backticks.
+
+    OUTPUT FORMAT (IMPORTANT):
+
+    - Return a SINGLE JSON object with exactly these keys:
+        1) "code": a string with the FULL {target_language} source file.
+        2) "python_requirements": a JSON array of strings for any third-party
+           Python packages that must be installed (for example ["matplotlib"]).
+
+    - Do NOT wrap the JSON in markdown or triple backticks.
+    - The response must be valid JSON by itself.
+
+    Example of the *shape* (not actual content):
+
+      {{
+        "code": "print('hello')\\n",
+        "python_requirements": ["matplotlib"]
+      }}
 
     Here is the full {source_language} source to convert:
 
@@ -154,6 +313,11 @@ def _build_conversion_prompt(
 
 
 def _call_google_conversion(prompt: str) -> str:
+    """
+    Call Google Gemini and return the raw text response.
+
+    The caller is responsible for parsing it as JSON artifacts.
+    """
     if not settings.GOOGLE_API_KEY:
         raise AIConversionError("GOOGLE_API_KEY is not set")
 
@@ -176,6 +340,12 @@ def _call_google_conversion(prompt: str) -> str:
 
 
 def _call_openai_conversion(prompt: str) -> str:
+    """
+    Call OpenAI and return raw text.
+
+    For OpenAI we currently expect plain code (no JSON envelope), so later
+    we will just wrap it in TargetArtifacts with empty python_requirements.
+    """
     if not settings.OPENAI_API_KEY:
         raise AIConversionError("OPENAI_API_KEY is not set")
 
@@ -202,7 +372,61 @@ def _call_openai_conversion(prompt: str) -> str:
     return text.strip()
 
 
-def generate_target_code_from_ai(
+def _strip_markdown_fences(raw: str) -> str:
+    """
+    Gemini sometimes returns ```json ... ``` even when we ask it not to.
+    This helper strips the outer ```...``` fences if present.
+    """
+    text = raw.strip()
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+
+        # Drop the first line (``` or ```json)
+        first = lines[0].strip()
+        if first.startswith("```"):
+            lines = lines[1:]
+
+        # Drop trailing fence if present
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+
+        text = "\n".join(lines).strip()
+
+    return text
+
+
+def _parse_gemini_artifacts(raw: str) -> TargetArtifacts:
+    """
+    Parse Gemini's JSON artifacts, being tolerant of markdown fences.
+    """
+    stripped = _strip_markdown_fences(raw)
+
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        # We let the caller decide whether to fall back to code-only.
+        raise AIConversionError(
+            f"Failed to parse Gemini JSON response: {exc}; raw={raw!r}"
+        ) from exc
+
+    code = data.get("code")
+    if not isinstance(code, str):
+        raise AIConversionError("Gemini JSON is missing 'code' string field")
+
+    py_reqs_field = data.get("python_requirements", [])
+    if py_reqs_field is None:
+        py_reqs_field = []
+    if not isinstance(py_reqs_field, list):
+        # Be defensive; ignore if not a list
+        py_reqs: List[str] = []
+    else:
+        py_reqs = [str(x).strip() for x in py_reqs_field if str(x).strip()]
+    cleaned_code = _clean_ai_code_string(code)
+    return TargetArtifacts(code=cleaned_code, python_requirements=py_reqs)
+
+
+def generate_target_artifacts_from_ai(
     *,
     repo_url: str,
     revision: str,
@@ -211,14 +435,17 @@ def generate_target_code_from_ai(
     contract: Optional[BehaviorContract],
     source_language: str,
     target_language: str,
-) -> str:
+) -> TargetArtifacts:
     """
     High-level helper:
 
     - Fetch source code from GitHub
     - Build a conversion prompt (with file-path context)
     - Call selected AI provider
-    - Return generated target-language code
+    - Parse provider response into TargetArtifacts
+
+    For Gemini (google), we *prefer* JSON artifacts but will fall back to
+    "code-only" if parsing fails.
     """
     source_code = _fetch_source_code_from_github(
         repo_url=repo_url,
@@ -236,8 +463,48 @@ def generate_target_code_from_ai(
     )
 
     if settings.AI_PROVIDER == "google":
-        return _call_google_conversion(prompt)
+        raw = _call_google_conversion(prompt)
+        try:
+            return _parse_gemini_artifacts(raw)
+        except AIConversionError:
+            # Fallback: try to salvage "code" and "python_requirements" even if
+            # the top-level JSON is slightly malformed.
+            stripped = _strip_markdown_fences(raw)
+            cleaned = _clean_ai_code_string(stripped)
+            code = _best_effort_extract_code_from_pseudo_json(cleaned)
+            py_reqs = _best_effort_extract_requirements_from_pseudo_json(stripped)
+            return TargetArtifacts(code=code, python_requirements=py_reqs)
     elif settings.AI_PROVIDER == "openai":
-        return _call_openai_conversion(prompt)
+        # For now we treat OpenAI as "code only".
+        cleaned = _clean_ai_code_string(_call_openai_conversion(prompt))
+        code = _call_openai_conversion(cleaned)
+        return TargetArtifacts(code=code, python_requirements=[])
     else:
         raise AIConversionError(f"Unsupported AI_PROVIDER: {settings.AI_PROVIDER}")
+
+
+def generate_target_code_from_ai(
+    *,
+    repo_url: str,
+    revision: str,
+    file_path: str,
+    behavior: Behavior,
+    contract: Optional[BehaviorContract],
+    source_language: str,
+    target_language: str,
+) -> str:
+    """
+    Backwards-compatible wrapper that returns ONLY the generated code.
+
+    Newer callers should use generate_target_artifacts_from_ai instead.
+    """
+    artifacts = generate_target_artifacts_from_ai(
+        repo_url=repo_url,
+        revision=revision,
+        file_path=file_path,
+        behavior=behavior,
+        contract=contract,
+        source_language=source_language,
+        target_language=target_language,
+    )
+    return artifacts.code

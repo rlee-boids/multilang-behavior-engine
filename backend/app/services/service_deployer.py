@@ -233,17 +233,19 @@ async def deploy_behavior_service(
         dockerfile_code = _render_perl_ui_dockerfile()
         internal_port = 5000
 
-    else:
-        # Python UI: no app.psgi, just a Dockerfile that runs the converted UI.
-        if not file_path.endswith(".py"):
-            # We can still try, but it's a strong signal something's off.
-            raise ServiceDeploymentError(
-                f"Python UI deployment expects a .py entrypoint, got file_path={file_path!r}"
-            )
-
+    elif language == "python":
+        # Python UI: we expect the AI to have generated a WSGI-style entry script
+        # at impl.file_path and a requirements.txt at the repo root.
+        #
+        # NO assumptions about the path (it may be app/ui/plot_ui.py, main.py, etc.),
+        # as long as running `python <file_path>` starts an HTTP server on port 8000.
         dockerfile_code = _render_python_ui_dockerfile(file_path)
-        # Match EXPOSE in the Python Dockerfile
         internal_port = 8000
+
+    else:
+        raise ServiceDeploymentError(
+            f"Only perl and python UI deployments are supported for now (got language={impl.language!r})"
+        )
 
     # --- 3. Write Dockerfile ---
     dockerfile_path = repo_root / "Dockerfile"
