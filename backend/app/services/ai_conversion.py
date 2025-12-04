@@ -425,6 +425,61 @@ def _parse_gemini_artifacts(raw: str) -> TargetArtifacts:
     cleaned_code = _clean_ai_code_string(code)
     return TargetArtifacts(code=cleaned_code, python_requirements=py_reqs)
 
+def _extract_google_artifacts(raw: str) -> TargetArtifacts:
+    """
+    Robustly extract (code, python_requirements) from a Gemini response.
+
+    Strategy:
+    - Strip markdown fences (```...```).
+    - Find the JSON object between the first '{' and last '}'.
+    - json.loads() that substring.
+    - Pull out "code" and "python_requirements".
+    - Run the code through _clean_ai_code_string.
+    - If anything goes wrong, fall back to treating the whole response as code.
+    """
+    if not raw:
+        raise AIConversionError("Empty response from Google Gemini")
+
+    # 1) Remove ``` and ```json fences if present
+    stripped = _strip_markdown_fences(raw).strip()
+
+    # 2) Try to isolate the JSON object between the first '{' and last '}'
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = stripped[start : end + 1]
+    else:
+        candidate = stripped
+
+    # 3) Try to parse JSON
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        # Fallback: Gemini did not give us parseable JSON;
+        # treat the entire stripped text as code.
+        code_fallback = _clean_ai_code_string(stripped)
+        return TargetArtifacts(code=code_fallback, python_requirements=[])
+
+    # 4) Extract code
+    code_field = data.get("code")
+    if not isinstance(code_field, str):
+        # If "code" is missing or wrong type, treat candidate as code
+        code_fallback = _clean_ai_code_string(stripped)
+        return TargetArtifacts(code=code_fallback, python_requirements=[])
+
+    code = _clean_ai_code_string(code_field)
+
+    # 5) Extract python_requirements
+    py_field = data.get("python_requirements", [])
+    if py_field is None:
+        py_field = []
+    if not isinstance(py_field, list):
+        py_reqs: List[str] = []
+    else:
+        py_reqs = [str(x).strip() for x in py_field if str(x).strip()]
+
+    return TargetArtifacts(code=code, python_requirements=py_reqs)
+
 
 def generate_target_artifacts_from_ai(
     *,
@@ -444,8 +499,15 @@ def generate_target_artifacts_from_ai(
     - Call selected AI provider
     - Parse provider response into TargetArtifacts
 
-    For Gemini (google), we *prefer* JSON artifacts but will fall back to
-    "code-only" if parsing fails.
+    For Gemini (google), we expect JSON:
+
+        {
+          "code": "<full target-language source>",
+          "python_requirements": ["matplotlib", ...]
+        }
+
+    If parsing fails, we fall back to treating the full response text as code.
+    For OpenAI, we currently treat the entire response as plain code.
     """
     source_code = _fetch_source_code_from_github(
         repo_url=repo_url,
@@ -464,21 +526,15 @@ def generate_target_artifacts_from_ai(
 
     if settings.AI_PROVIDER == "google":
         raw = _call_google_conversion(prompt)
-        try:
-            return _parse_gemini_artifacts(raw)
-        except AIConversionError:
-            # Fallback: try to salvage "code" and "python_requirements" even if
-            # the top-level JSON is slightly malformed.
-            stripped = _strip_markdown_fences(raw)
-            cleaned = _clean_ai_code_string(stripped)
-            code = _best_effort_extract_code_from_pseudo_json(cleaned)
-            py_reqs = _best_effort_extract_requirements_from_pseudo_json(stripped)
-            return TargetArtifacts(code=code, python_requirements=py_reqs)
+        # Let the helper handle JSON vs fallback
+        return _extract_google_artifacts(raw)
+
     elif settings.AI_PROVIDER == "openai":
-        # For now we treat OpenAI as "code only".
-        cleaned = _clean_ai_code_string(_call_openai_conversion(prompt))
-        code = _call_openai_conversion(cleaned)
+        # For now we treat OpenAI as "code-only".
+        code = _call_openai_conversion(prompt)
+        code = _clean_ai_code_string(code)
         return TargetArtifacts(code=code, python_requirements=[])
+
     else:
         raise AIConversionError(f"Unsupported AI_PROVIDER: {settings.AI_PROVIDER}")
 
